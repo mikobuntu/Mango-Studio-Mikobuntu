@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // This file is part of Lemon Studio: https://github.com/ItsAlphaNeon/Lemon-Studio
 
-//! Writes the factory presets (`crates/os-app/factory-presets/Mango Beat/*.ospreset`): one Mango Beat state each,
-//! the grids of a classic shape and the parameters at their defaults. The gate patterns are generated for the
-//! default four-bar cycle, so their names keep their per-beat meanings. Run from the repository root:
+//! Writes the factory presets (`crates/os-app/factory-presets/Mango Beat/*.ospreset`): one Mango Beat state
+//! each. The presets are the plugin's own two lists — time presets and volume presets, Gross Beat's two banks —
+//! and each state carries the preset's *recipe* (`tgen` / `vgen`) beside the grid it materialized into at the
+//! default four-bar cycle, so the grid re-materializes when the cycle moves and the gates keep their per-beat
+//! meanings at every cycle length. Run from the repository root:
 //!
 //! ```text
 //! cargo run -p mango-beat --example presets
@@ -12,58 +14,58 @@
 
 use std::path::Path;
 
-use mango_beat::dsp;
-use mango_beat::grid::{Curve, GridState, Pt};
+use mango_beat::grid::GridState;
+use mango_beat::presets;
 
-/// The presets: (name, grids).
-fn presets() -> Vec<(&'static str, GridState)> {
-    let const_time = |rate: f32| {
-        let mut g = GridState::default();
-        g.time[0] = Curve::constant(GridState::y_of_rate(rate));
-        g
-    };
-    let mut_with_time = |c: Curve| {
-        let mut g = GridState::default();
-        g.time[0] = c;
-        g
-    };
-    let mut_with_vol = |c: Curve| {
-        let mut g = GridState::default();
-        g.volume[0] = c;
-        g
-    };
-    // The scratch: eight straight runs, four times forwards, four times backwards.
-    let mut scratch = Curve::default();
-    for k in 0..=8 {
-        let y = if k % 2 == 0 { 0.75 } else { 0.125 };
-        scratch.pts.push(Pt::new(k as f32 / 8.0, y, 0.0, 0));
-    }
-    // The pump: a quick dip, a smooth climb back to the top.
-    let pump = Curve {
-        pts: vec![Pt::new(0.0, 1.0, -0.4, 0), Pt::new(0.3, 0.45, 0.0, 9), Pt::new(1.0, 1.0, 0.0, 9)],
-    };
-    let tape_stop = Curve { pts: vec![Pt::new(0.0, 0.5, 0.0, 0), Pt::new(1.0, 0.26, 0.7, 0)] };
-    vec![
-        ("Default", GridState::default()),
-        ("Half Time", const_time(0.5)),
-        ("Double Time", const_time(2.0)),
-        ("Tape Stop", mut_with_time(tape_stop)),
-        ("Reverse", const_time(-1.0)),
-        ("Scratch", mut_with_time(scratch)),
-        ("Trance Gate 1-8", mut_with_vol(dsp::gate(2, 16.0))),
-        ("Trance Gate 1-16", mut_with_vol(dsp::gate(4, 16.0))),
-        ("Triplet Chop", mut_with_vol(dsp::gate(3, 16.0))),
-        ("Sidechain Pump", mut_with_vol(pump)),
-        ("Half Time Gate", {
-            let mut g = const_time(0.5);
-            g.volume[0] = dsp::gate(2, 16.0);
-            g
-        }),
-    ]
+/// One preset to write: the name, the section's recipe ("" = leave the section at its default) and the other
+/// section's recipe.
+struct Out {
+    name: &'static str,
+    tgen: &'static str,
+    vgen: &'static str,
 }
 
-/// The plugin's saved state for `grids`: the parameters at their defaults and the grids in the state's field.
-fn state(grids: &GridState) -> Vec<u8> {
+/// The presets, in the plugin's two lists' order.
+fn presets() -> Vec<Out> {
+    let time = |name, recipe| Out { name, tgen: recipe, vgen: "" };
+    let vol = |name, recipe| Out { name, tgen: "", vgen: recipe };
+    let mut out = vec![];
+    for p in presets::TIME_PRESETS {
+        out.push(time(p.name, p.recipe));
+    }
+    for p in presets::VOL_PRESETS {
+        out.push(vol(p.name, p.recipe));
+    }
+    // The combined one: half time under the classic trance gate.
+    out.push(Out { name: "Half Time Gate", tgen: r#"{"k":"rate","r":0.5}"#, vgen: r#"{"k":"gate","spb":2.0}"# });
+    out
+}
+
+/// The plugin's saved state: the parameters at their defaults, the grids materialized at the default four-bar
+/// cycle and the recipes beside them.
+fn state(tgen: &str, vgen: &str) -> Vec<u8> {
+    const DEFAULT_CYCLE: f32 = 16.0;
+    // The recipes travel in the gen form (slot 0, the recipe beside it).
+    let tgen = if tgen.is_empty() { String::new() } else { presets::gen_for(0, tgen) };
+    let vgen = if vgen.is_empty() { String::new() } else { presets::gen_for(0, vgen) };
+    let mut g = GridState::default();
+    if !tgen.is_empty() {
+        if let Some((slot, recipe)) = presets::parse_gen(&tgen) {
+            g.time[slot.min(3)] = presets::materialize(&recipe, DEFAULT_CYCLE).unwrap_or_default();
+        }
+    }
+    if !vgen.is_empty() {
+        if let Some((slot, recipe)) = presets::parse_gen(&vgen) {
+            g.volume[slot.min(3)] = presets::materialize(&recipe, DEFAULT_CYCLE).unwrap_or_default();
+        }
+    }
+    let mut fields = serde_json::json!({ "grid": g.to_json() });
+    if !tgen.is_empty() {
+        fields["tgen"] = serde_json::json!(tgen);
+    }
+    if !vgen.is_empty() {
+        fields["vgen"] = serde_json::json!(vgen);
+    }
     let json = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "params": {
@@ -73,7 +75,7 @@ fn state(grids: &GridState) -> Vec<u8> {
             "vol_slot": { "i32": 0 },
             "cycle": { "i32": 3 },
         },
-        "fields": { "grid": grids.to_json() },
+        "fields": fields,
     })
     .to_string();
     // The CLAP state form: the length in front of the JSON.
@@ -85,12 +87,12 @@ fn state(grids: &GridState) -> Vec<u8> {
 fn main() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/os-app/factory-presets/Mango Beat");
     std::fs::create_dir_all(&dir).expect("preset folder");
-    for (name, grids) in presets() {
+    for p in presets() {
         let header = format!("plugin=Mango Beat\tid=clap:org.openstudio.mango-beat\tformat=clap\n");
         let mut file = b"OSPRESET 1\n".to_vec();
         file.extend_from_slice(header.as_bytes());
-        file.extend_from_slice(&state(&grids));
-        let path = dir.join(format!("{name}.ospreset"));
+        file.extend_from_slice(&state(p.tgen, p.vgen));
+        let path = dir.join(format!("{}.ospreset", p.name));
         std::fs::write(&path, &file).expect("preset file");
         println!("wrote {}", path.display());
     }

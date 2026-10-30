@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // This file is part of Lemon Studio: https://github.com/ItsAlphaNeon/Lemon-Studio
 
-//! Mango Beat editor: painting and hit regions (platform independent). Two beat grids — TIME over VOLUME — drawn
-//! like the playlist draws automation (a filled curve over ruled quarters, points and tension handles), with the
-//! sections' slot buttons and mix dials in the rail at the left, the hint well and the wordmark along the foot.
+//! Mango Beat editor: painting and hit regions (platform independent). Two cycle grids — TIME over VOLUME —
+//! drawn like the playlist draws automation (a filled curve over ruled beats and bars, points and tension
+//! handles), with the sections' slot buttons and mix dials in the rail at the left, the hint well and the
+//! wordmark along the foot.
 //!
 // spec: plugins/mango-beat.md (§1 window, §2 controls, §3 hints)
 
@@ -21,7 +22,7 @@ use crate::grid::{Curve, GridState, Mode};
 pub const W: u32 = 760;
 pub const H: u32 = 470;
 
-/// The sections: the time grid (the playback rate) and the volume grid (the gate).
+/// The sections: the time grid (the offset back from the live sound) and the volume grid (the gate).
 pub const TIME: usize = 0;
 pub const VOL: usize = 1;
 
@@ -148,38 +149,45 @@ pub fn gx(sec_grid: usize, x: f32) -> f32 {
     g.x + g.w * x.clamp(0.0, 1.0)
 }
 
-/// The y on a grid for an envelope value (0..1, up = more).
+/// The y on a grid for an envelope value (0..1): the volume well has up = more, the time well has DOWN =
+/// further into the past (Gross Beat's panel: the top edge is the live sound).
 pub fn gy(sec_grid: usize, y: f32) -> f32 {
     let g = &GRIDS[sec_grid];
-    g.bottom() - g.h * y.clamp(0.0, 1.0)
+    if sec_grid == TIME {
+        g.y + g.h * y.clamp(0.0, 1.0)
+    } else {
+        g.bottom() - g.h * y.clamp(0.0, 1.0)
+    }
 }
 
 /// The beat position and envelope value at a point on a grid.
 pub fn value_at(sec_grid: usize, x: f32, y: f32) -> (f32, f32) {
     let g = &GRIDS[sec_grid];
-    (((x - g.x) / g.w).clamp(0.0, 1.0), ((g.bottom() - y) / g.h).clamp(0.0, 1.0))
+    let v = if sec_grid == TIME { (y - g.y) / g.h } else { (g.bottom() - y) / g.h };
+    (((x - g.x) / g.w).clamp(0.0, 1.0), v.clamp(0.0, 1.0))
 }
 
-/// A rate's text on the time grid ("2.0x", "-0.5x", "1x").
-pub fn rate_text(rate: f32) -> String {
-    if (rate - 1.0).abs() < 1e-3 {
-        "1x".into()
-    } else if rate < 0.0 {
-        format!("-{}", pretty_rate(-rate))
-    } else {
-        pretty_rate(rate)
-    }
+/// The cycle the wells rule themselves by, from the model.
+pub fn cycle_of(m: &dyn Model) -> f32 {
+    crate::params::CYCLE_BEATS[(m.plain("cycle").round() as i32).clamp(0, 3) as usize]
 }
 
-fn pretty_rate(rate: f32) -> String {
-    if rate >= 10.0 {
-        format!("{rate:.0}x")
-    } else if (rate - rate.round()).abs() < 1e-3 && rate >= 1.0 {
-        format!("{rate:.0}x")
-    } else if rate < 1.0 && (1.0 / rate - (1.0 / rate).round()).abs() < 1e-3 && (1.0 / rate) <= 16.0 {
-        format!("1/{}x", (1.0 / rate).round() as i32)
+/// An offset's text on the time grid ("live", "1 beat", "1 bar", "1.5 beats", "2 bars").
+pub fn offset_text(offset: f32) -> String {
+    let o = offset.max(0.0);
+    if o < 1e-3 {
+        "live".into()
+    } else if (o - 4.0).abs() < 1e-3 {
+        "1 bar".into()
+    } else if (o - 8.0).abs() < 1e-3 {
+        "2 bars".into()
+    } else if (o - o.round()).abs() < 1e-3 {
+        match o.round() as i32 {
+            1 => "1 beat".into(),
+            n => format!("{n} beats"),
+        }
     } else {
-        format!("{rate:.2}x")
+        format!("{o:.1} beats")
     }
 }
 
@@ -260,32 +268,52 @@ fn heading(ui: &mut Ui, x0: f32, x1: f32, y: f32, s: &str) {
     }
 }
 
-/// One grid well: the ruled beat (quarters, and the twenty-fourths fainter), the value guides and their labels.
+/// One grid well: the cycle's beats ruled (bars strong, beats medium, quarter-beats faint when they fit), the
+/// value guides and their labels.
 fn grid_well(ui: &mut Ui, sec: usize, g: &Rect) {
     lemon::plug_well(ui.c, g.outset(1.0), 6.0);
     ui.c.push_clip(g.inset(0.5));
-    // The beat's twenty-fourths, quarters ruled.
-    for k in 1..24 {
-        if k % 6 == 0 {
-            continue;
-        }
-        let x = g.x + g.w * k as f32 / 24.0;
-        let col = if k % 3 == 0 { plug::FAINT.with_alpha(80) } else { plug::GRID };
+    // The cycle's beats, Gross Beat's panel ruled in musical time: bars strong, beats medium, and the
+    // quarter-beats faint when the cycle is short enough to show them.
+    let cycle = cycle_of(ui.m);
+    let beats = cycle.round() as usize;
+    for b in 1..beats {
+        let x = g.x + g.w * b as f32 / beats as f32;
+        let col = if b % 4 == 0 { plug::FAINT.with_alpha(140) } else { plug::GRID };
         ui.c.fill_rect(Rect::span(x, x + 1.0, g.y + 3.0, g.bottom() - 3.0), col);
     }
-    for k in 1..4 {
-        let x = g.x + g.w * k as f32 / 4.0;
-        ui.c.fill_rect(Rect::span(x, x + 1.0, g.y + 3.0, g.bottom() - 3.0), plug::FAINT.with_alpha(140));
+    if beats <= 4 {
+        for q in 1..beats * 4 {
+            if q % 4 == 0 {
+                continue;
+            }
+            let x = g.x + g.w * q as f32 / (beats * 4) as f32;
+            ui.c.fill_rect(Rect::span(x, x + 1.0, g.y + 3.0, g.bottom() - 3.0), plug::GRID);
+        }
     }
     // The value guides.
     let lh = ui.c.line_height(MARK);
     if sec == TIME {
-        for (y, name) in [(0.75, "4x"), (0.625, "2x"), (0.5, "1x"), (0.375, "1/2x"), (0.25, "1/4x")] {
-            let yy = gy(TIME, y).round();
-            let strong = y == 0.5;
+        // The offset scale: the top edge is the live sound, the bottom edge two bars back.
+        for (off, name) in [(0.0, "live"), (1.0, "1 beat"), (4.0, "1 bar"), (8.0, "2 bars")] {
+            let yy = gy(TIME, GridState::y_of_offset(off)).round();
+            let strong = off == 0.0;
             ui.c.fill_rect(Rect::span(g.x + 3.0, g.right() - 3.0, yy, yy + 1.0), if strong { plug::DIM } else { plug::FAINT });
             let w = ui.c.text_width(MARK, name);
-            ui.c.text(MARK, g.right() - 8.0 - w, yy - lh - 2.0, plug::DIM, name);
+            // The live line rides the well's top edge: its label sits under it, the rest above their lines.
+            let ty = if off == 0.0 { yy + 3.0 } else { yy - lh - 2.0 };
+            ui.c.text(MARK, g.right() - 8.0 - w, ty, plug::DIM, name);
+        }
+        // Gross Beat's angled guides from the top-left corner: the safety line (the pause slope, the offset
+        // growing a beat a beat) and, steeper, the reverse guide (two beats a beat).
+        let (x0, y0) = (gx(TIME, 0.0), gy(TIME, 0.0));
+        let xe = (crate::grid::PANEL_BEATS / cycle).min(1.0);
+        let ye = (cycle / crate::grid::PANEL_BEATS).min(1.0);
+        ui.c.polyline(&[(x0, y0), (gx(TIME, xe), gy(TIME, ye))], 1.0, plug::DIM.with_alpha(110));
+        if cycle <= 4.0 {
+            let xr = (crate::grid::PANEL_BEATS / (2.0 * cycle)).min(1.0);
+            let yr = (cycle / (crate::grid::PANEL_BEATS / 2.0)).min(1.0);
+            ui.c.polyline(&[(x0, y0), (gx(TIME, xr), gy(TIME, yr))], 1.0, plug::FAINT.with_alpha(130));
         }
     } else {
         for (y, name) in [(1.0, "0 dB"), (0.5, "-6"), (0.25, "-12"), (0.125, "-18")] {
@@ -305,8 +333,9 @@ fn curve_shape(ui: &mut Ui, sec: usize, curve: &Curve, ink: Color, editing: bool
     let steps = 120;
     let pts = curve.polyline(steps);
     if pts.is_empty() {
-        // An empty section draws its default line (the sound plays it): the time centre, the wide-open gate.
-        let y = if sec == TIME { gy(sec, 0.5) } else { gy(sec, 1.0) };
+        // An empty section draws its default line (the sound plays it): the live sound on the time grid, the
+        // wide-open gate on the volume one.
+        let y = if sec == TIME { gy(sec, 0.0) } else { gy(sec, 1.0) };
         ui.c.push_clip(g);
         ui.c.fill_rect(Rect::span(g.x + 2.0, g.right() - 2.0, y.round(), y.round() + 1.0), CURVE_DIM.with_alpha(160));
         ui.c.pop_clip();
@@ -422,7 +451,7 @@ pub fn hint(t: &Target, m: &dyn Model, grids: &GridState) -> String {
             format!("{}: {}", name, slot_name(*slot))
         }
         Target::Cycle(i) => format!("Cycle: {}", crate::params::value_text(crate::params::CYCLE, *i as i32)),
-        Target::Point(sec, slot, i) => point_hint(*sec, *slot, *i, grids),
+        Target::Point(sec, slot, i) => point_hint(*sec, *slot, *i, grids, cycle_of(m)),
         Target::Grid(sec) => {
             let name = if *sec == TIME { "Time grid" } else { "Volume grid" };
             format!("{name}: click to plant a point")
@@ -434,19 +463,17 @@ fn params_of(id: &str) -> Option<usize> {
     crate::params::DEFS.iter().position(|d| d.id == id)
 }
 
-/// A point's hint: its place in the beat and its value on its section's scale.
-pub fn point_hint(sec: usize, slot: usize, i: usize, grids: &GridState) -> String {
+/// A point's hint: its place in the cycle and its value on its section's scale.
+pub fn point_hint(sec: usize, slot: usize, i: usize, grids: &GridState, cycle: f32) -> String {
     let curve = if sec == TIME { &grids.time[slot.min(3)] } else { &grids.volume[slot.min(3)] };
     let Some(p) = curve.pts.get(i) else { return "Point".into() };
     let at = if p.x <= 0.0 {
         "the start".into()
-    } else if (24.0 * p.x).fract() < 1e-3 {
-        format!("cycle {}/24", (24.0 * p.x).round() as i32)
     } else {
-        format!("cycle {:.3}", p.x)
+        format!("beat {:.2}", p.x * cycle)
     };
     let name = if sec == TIME { "Time" } else { "Volume" };
-    let value = if sec == TIME { rate_text(GridState::rate_of_y(p.y)) } else { db_text(p.y) };
+    let value = if sec == TIME { offset_text(GridState::offset_of_y(p.y)) } else { db_text(p.y) };
     format!("{name} {}, point {}: {at}, {value}", slot_name(slot), i + 1)
 }
 
