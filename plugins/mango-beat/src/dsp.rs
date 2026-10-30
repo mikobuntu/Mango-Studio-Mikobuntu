@@ -40,11 +40,14 @@ pub struct Settings {
     /// The time slot (0..4) and the volume slot (0..4) playing.
     pub time_slot: usize,
     pub vol_slot: usize,
+    /// The envelope cycle's length in beats (2, 4, 8 or 16: half a bar through four bars of 4/4). Both grids'
+    /// curves span one cycle; a half-time passage can now stretch across four bars before the grid repeats.
+    pub cycle_beats: f32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { time_mix: 1.0, vol_mix: 1.0, time_slot: 0, vol_slot: 0 }
+        Settings { time_mix: 1.0, vol_mix: 1.0, time_slot: 0, vol_slot: 0, cycle_beats: 16.0 }
     }
 }
 
@@ -61,7 +64,7 @@ pub struct Beat {
     write: usize,
     /// The read head's distance behind the write head, in frames.
     d: f64,
-    /// Where in the beat the envelopes are (0..1).
+    /// Where in the envelope cycle the envelopes are (0..1; the cycle is `Settings::cycle_beats` beats long).
     phase: f64,
     /// The transport: playing, and the beats the next block should start at (jumps reposition the envelopes).
     playing: bool,
@@ -114,6 +117,11 @@ impl Beat {
         self.settings = *s;
     }
 
+    /// The cycle's length in beats, kept sane whatever a project's state carries.
+    fn cycle(&self) -> f64 {
+        f64::from(self.settings.cycle_beats.clamp(0.5, 64.0))
+    }
+
     /// The grids moved (the editor edited, a preset or a project loaded): the sound plays them from the next block.
     pub fn set_grids(&mut self, g: GridState) {
         self.grids = g;
@@ -160,7 +168,10 @@ impl Beat {
             }
             self.playing = true;
             self.next_beats = Some(ts.beats + frames as f64 * bps);
-            self.run(l, r, frames, ts.beats.rem_euclid(1.0), bps);
+            // The envelopes follow the host's beats through the cycle: beat 0 of the song and every `cycle` beats
+            // after it land at the cycle's start.
+            let cycle = self.cycle();
+            self.run(l, r, frames, ts.beats.rem_euclid(cycle) / cycle, bps);
         } else {
             self.playing = false;
             self.next_beats = None;
@@ -176,13 +187,14 @@ impl Beat {
 
     fn run(&mut self, l: &mut [f32], r: &mut [f32], frames: usize, mut phase: f64, bps: f64) {
         let mask = HISTORY - 1;
+        let cycle = self.cycle();
         let (tm, vm) = (self.settings.time_mix.clamp(0.0, 1.0), self.settings.vol_mix.clamp(0.0, 1.0));
         let time_on = !self.grids.time[self.settings.time_slot.min(3)].pts.is_empty() && tm > 0.0;
         let vol_on = !self.grids.volume[self.settings.vol_slot.min(3)].pts.is_empty() && vm > 0.0;
         for k in 0..frames {
-            // The envelopes at this frame.
+            // The envelopes at this frame (a frame is `bps` beats, the cycle is `cycle` beats long).
             if bps > 0.0 {
-                phase += bps;
+                phase += bps / cycle;
                 phase = phase.rem_euclid(1.0);
             }
             let rate = if time_on { self.rate_at(phase) } else { 1.0 };
@@ -234,12 +246,14 @@ pub fn constant_time(rate: f32) -> crate::grid::Curve {
     crate::grid::Curve::constant(GridState::y_of_rate(rate))
 }
 
-/// A gate grid of `steps` equal on-off steps per beat (1 = an eighth-note gate at steps 2).
-pub fn gate(steps: usize) -> crate::grid::Curve {
+/// A gate grid of `steps` equal on-off steps per beat across a `cycle_beats`-beat cycle (`gate(2, 16.0)` is the
+/// classic eighth-note trance gate over the four-bar default cycle).
+pub fn gate(steps: usize, cycle_beats: f32) -> crate::grid::Curve {
     let hold = Mode::Hold as u8;
+    let total = (steps.max(1) as f32 * cycle_beats.max(0.5)).round() as usize;
+    let step = 1.0 / total as f32;
     let mut pts = Vec::new();
-    let step = 1.0 / steps.max(1) as f32;
-    for k in 0..steps {
+    for k in 0..total {
         pts.push(Pt::new(step * k as f32, 1.0, 0.0, hold));
         pts.push(Pt::new(step * (k as f32 + 0.5), 0.0, 0.0, hold));
     }
@@ -315,10 +329,12 @@ mod tests {
     }
 
     /// A backwards rate walks the read head back through what just played: after half a beat at the sound's own
-    /// speed, the reverse half of the grid plays it descending.
+    /// speed, the reverse half of the grid plays it descending (the cycle pinned to one beat keeps the numbers
+    /// small; the four-bar default gets its own test below).
     #[test]
     fn backwards_rates_play_the_past_in_reverse() {
         let mut b = beat();
+        b.set(&Settings { cycle_beats: 1.0, ..Settings::default() });
         let mut g = GridState::default();
         let rev = GridState::y_of_rate(-1.0);
         g.time[0] = Curve {
@@ -334,10 +350,12 @@ mod tests {
         assert!(slope < -0.00003, "slope {slope}");
     }
 
-    /// A gate closes and opens where its points say, smoothly (no step wider than the smoothing).
+    /// A gate closes and opens where its points say, smoothly (no step wider than the smoothing); the cycle is
+    /// pinned to one beat so a point at 0.5 sits half a beat in.
     #[test]
     fn the_gate_closes_where_its_points_say() {
         let mut b = beat();
+        b.set(&Settings { cycle_beats: 1.0, ..Settings::default() });
         let mut g = GridState::default();
         g.volume[0] = Curve { pts: vec![Pt::new(0.0, 1.0, 0.0, Mode::Hold as u8), Pt::new(0.5, 0.0, 0.0, Mode::Hold as u8)] };
         b.set_grids(g);
@@ -382,7 +400,7 @@ mod tests {
         let mut b = beat();
         let mut g = GridState::default();
         g.time[0] = constant_time(0.5);
-        g.volume[0] = gate(2);
+        g.volume[0] = gate(2, 16.0);
         b.set_grids(g);
         let n = 256;
         let mut l: Vec<f32> = vec![0.5; n];
@@ -439,7 +457,7 @@ mod tests {
         let mut b = beat();
         let mut g = GridState::default();
         g.time[0] = constant_time(0.5);
-        g.volume[0] = gate(2);
+        g.volume[0] = gate(2, 16.0);
         b.set_grids(g);
         b.set(&Settings { time_mix: 0.0, vol_mix: 0.0, ..Settings::default() });
         let n = 256;
@@ -451,13 +469,36 @@ mod tests {
         assert_eq!(r, ir);
     }
 
-    /// A gate of two equal steps makes the eighth-note pattern the classic trance gate rides on.
+    /// A gate of two equal steps makes the eighth-note pattern the classic trance gate rides on (over a one-beat
+    /// cycle), and the cycle stretches the same pattern across its length.
     #[test]
     fn gate_steps_alternate() {
-        let g = gate(2);
+        let g = gate(2, 1.0);
         assert_eq!(g.pts.len(), 4);
         assert!((g.value_at(0.1).unwrap() - 1.0).abs() < 1e-6, "open on the first half of the step");
         assert_eq!(g.value_at(0.3), Some(0.0), "closed on the second half");
+        assert_eq!(gate(2, 16.0).pts.len(), 64, "two steps a beat over the four-bar default: 32 on-off pairs");
+    }
+
+    /// The cycle stretches the envelopes: with the four-bar default, a gate that closes at the cycle's midpoint
+    /// stays open through beat 7.9 and is closed by beat 8.1 (the host's beats map into the cycle).
+    #[test]
+    fn the_cycle_stretches_the_envelopes() {
+        let mut b = beat();
+        let mut g = GridState::default();
+        g.volume[0] = Curve { pts: vec![Pt::new(0.0, 1.0, 0.0, Mode::Hold as u8), Pt::new(0.5, 0.0, 0.0, Mode::Hold as u8)] };
+        b.set_grids(g);
+        let n = 1024;
+        // Beat 7.9: the block ends at phase 0.4964, still the cycle's open first half.
+        let mut l = vec![1.0; n];
+        let mut r = vec![1.0; n];
+        b.process(&mut l, &mut r, Some(TransportStep { playing: true, beats: 7.9 }));
+        assert!(l.iter().all(|v| *v > 0.99), "open before the cycle's midpoint");
+        // Beat 8.1: past the midpoint the gate shuts (the smoothing takes half a millisecond).
+        let mut l = vec![1.0; n];
+        let mut r = vec![1.0; n];
+        b.process(&mut l, &mut r, Some(TransportStep { playing: true, beats: 8.1 }));
+        assert!(*l.last().unwrap() < 0.01, "closed after the cycle's midpoint: {}", l.last().unwrap());
     }
 }
 

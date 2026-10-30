@@ -304,6 +304,11 @@ impl Logic {
                 self.edit(pid, n);
                 self.view.active = Some((*sec, *slot, 0));
             }
+            (Target::Cycle(_), Btn::Right) => acts.push(Act::Menu(MenuReq::Param("cycle".into()), x, y)),
+            (Target::Cycle(i), Btn::Left) => {
+                let n = self.vals.plain_to_norm("cycle", *i as f32);
+                self.edit("cycle", n);
+            }
             (Target::Grid(sec), Btn::Right) => acts.push(Act::Menu(MenuReq::Section(*sec, self.shown_slot(*sec)), x, y)),
             (Target::Grid(sec), Btn::Left) => {
                 // A click on the empty grid plants a point there (on the beat's twenty-fourths).
@@ -649,6 +654,8 @@ mod tests {
             if k == crate::params::TIME_SLOT || k == crate::params::VOL_SLOT {
                 let sec = if k == crate::params::TIME_SLOT { view::TIME } else { view::VOL };
                 assert!((0..4).any(|slot| l.hits.iter().any(|h| h.t == Target::Slot(sec, slot))), "{}", d.id);
+            } else if k == crate::params::CYCLE {
+                assert!((0..4).any(|i| l.hits.iter().any(|h| h.t == Target::Cycle(i))), "{}", d.id);
             } else {
                 assert!(l.hits.iter().any(|h| h.t.id() == d.id), "{}", d.id);
             }
@@ -797,7 +804,7 @@ mod tests {
         save(&mut l, "beat_default_x2", 2.0);
         // A half-time time grid and a trance gate.
         l.grids.time[0] = crate::grid::Curve { pts: vec![crate::grid::Pt::new(0.0, 0.375, 0.6, 0), crate::grid::Pt::new(1.0, 0.0, 0.0, 12)] };
-        l.grids.volume[0] = crate::dsp::gate(2);
+        l.grids.volume[0] = crate::dsp::gate(2, 16.0);
         l.hint = "Time A, point 1: beat 12/24, -2.0x".into();
         save(&mut l, "beat_halftime_gate", 1.0);
     }

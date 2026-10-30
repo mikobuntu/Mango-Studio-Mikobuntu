@@ -38,6 +38,11 @@ pub const MIX_CX: f32 = 69.0;
 pub const MIX_CYS: [f32; 2] = [158.0, 366.0];
 pub const MIX_R: f32 = 20.0;
 
+/// The cycle picker in the band between the wells (it governs both grids).
+pub const CYCLE_Y: f32 = 214.0;
+pub const CYCLE_H: f32 = 20.0;
+pub const CYCLE_BW: f32 = 56.0;
+
 /// The foot's centre line: the hint well at the left and the wordmark at the right.
 const FOOT: f32 = 446.0;
 const RIGHT: f32 = 750.0;
@@ -83,6 +88,8 @@ pub enum Target {
     Knob(String),
     /// A section's slot button (click picks the slot; menu on right click).
     Slot(usize, usize),
+    /// A cycle button in the band between the wells (click picks the length; menu on right click).
+    Cycle(usize),
     /// An envelope point: section, slot, point (drag moves it; menu on right click).
     Point(usize, usize, usize),
     /// A grid well away from its points: a click plants a point there.
@@ -220,6 +227,8 @@ pub fn paint(c: &mut Canvas, t: &Palette, m: &dyn Model, st: &ViewState, grids: 
         }
         knob(&mut ui, mix_id, MIX_CX, MIX_CYS[sec], MIX_R, "MIX", false);
     }
+    // The cycle both grids ride on.
+    cycle_picker(&mut ui);
     // The foot.
     let mark_left = logo(&mut ui);
     let well = Rect::span(8.0, mark_left - 16.0, FOOT - 11.0, FOOT + 11.0);
@@ -352,6 +361,26 @@ fn slot_button(ui: &mut Ui, sec: usize, slot: usize) {
     ui.hit(r, target);
 }
 
+/// The cycle picker: a small label and four choice buttons in the band between the wells, the active length lit.
+fn cycle_picker(ui: &mut Ui) {
+    let names = ["½ BAR", "1 BAR", "2 BARS", "4 BARS"];
+    let on = (ui.m.plain("cycle").round() as i32).clamp(0, 3) as usize;
+    let gap = 8.0;
+    let label_w = 44.0;
+    let group_w = label_w + 8.0 + 4.0 * CYCLE_BW + 3.0 * gap;
+    let x0 = (GRIDS[0].x + GRIDS[0].right()) / 2.0 - group_w / 2.0;
+    let lh = ui.c.line_height(LABEL);
+    ui.c.text(LABEL, x0, CYCLE_Y + (CYCLE_H - lh) / 2.0, plug::DIM, "CYCLE");
+    for (i, name) in names.iter().enumerate() {
+        let r = Rect::new(x0 + label_w + 8.0 + i as f32 * (CYCLE_BW + gap), CYCLE_Y, CYCLE_BW, CYCLE_H);
+        let target = Target::Cycle(i);
+        let st = ui.state(r, &target, false);
+        let ink = lemon::choice_button(ui.c, r, on == i, brand::MAIN, st);
+        ui.c.text_center(LABEL, r, ink, name);
+        ui.hit(r, target);
+    }
+}
+
 /// A pith dial of radius `r`, caption under it.
 fn knob(ui: &mut Ui, id: &str, cx: f32, cy: f32, r: f32, cap: &str, bipolar: bool) {
     let target = Target::Knob(id.into());
@@ -392,6 +421,7 @@ pub fn hint(t: &Target, m: &dyn Model, grids: &GridState) -> String {
             let name = if *sec == TIME { "Time slot" } else { "Volume slot" };
             format!("{}: {}", name, slot_name(*slot))
         }
+        Target::Cycle(i) => format!("Cycle: {}", crate::params::value_text(crate::params::CYCLE, *i as i32)),
         Target::Point(sec, slot, i) => point_hint(*sec, *slot, *i, grids),
         Target::Grid(sec) => {
             let name = if *sec == TIME { "Time grid" } else { "Volume grid" };
@@ -411,9 +441,9 @@ pub fn point_hint(sec: usize, slot: usize, i: usize, grids: &GridState) -> Strin
     let at = if p.x <= 0.0 {
         "the start".into()
     } else if (24.0 * p.x).fract() < 1e-3 {
-        format!("beat {}/24", (24.0 * p.x).round() as i32)
+        format!("cycle {}/24", (24.0 * p.x).round() as i32)
     } else {
-        format!("beat {:.3}", p.x)
+        format!("cycle {:.3}", p.x)
     };
     let name = if sec == TIME { "Time" } else { "Volume" };
     let value = if sec == TIME { rate_text(GridState::rate_of_y(p.y)) } else { db_text(p.y) };
@@ -427,5 +457,6 @@ pub fn values(m: &dyn Model) -> dsp::Settings {
         vol_mix: m.plain("vol_mix") / 10000.0,
         time_slot: (m.plain("time_slot").round() as i32).clamp(0, 3) as usize,
         vol_slot: (m.plain("vol_slot").round() as i32).clamp(0, 3) as usize,
+        cycle_beats: crate::params::CYCLE_BEATS[(m.plain("cycle").round() as i32).clamp(0, 3) as usize],
     }
 }
