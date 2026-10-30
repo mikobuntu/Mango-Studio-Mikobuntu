@@ -4,9 +4,9 @@
 
 //! Lemon Studio's small effects as VST3 / CLAP plugins (nih-plug): Lemon Soft Clipper, Lemon Fast Distortion, Lemon
 //! Balance, Lemon Stereo Enhancer, Lemon Transient Processor, Lemon Chorus, Lemon Stereo Shaper, Lemon Filter,
-//! Lemon Flanger and Lemon Phaser. Each is a handful
+//! Lemon Flanger, Lemon Phaser and Mango 12. Each is a handful
 //! of settings over a sound of
-//! `os_engine::effects`, so they share
+//! `os_engine::effects` (Mango 12 has its own), so they share
 //! everything but their description: the plugin, its parameters and saved state ([`params`]), the Pith editor
 //! ([`editor`], [`view`]). A description ([`Spec`]) gives the settings, their value texts, the editor's cards and
 //! controls, and the sound. The plugin modules (`plugins/lemon-soft-clipper` and the others) export one each.
@@ -30,6 +30,7 @@ pub mod phaser;
 pub mod soft_clipper;
 pub mod stereo_enhancer;
 pub mod stereo_shaper;
+pub mod twelve;
 pub mod transient_processor;
 pub mod view;
 
@@ -161,6 +162,13 @@ pub struct Spec {
     pub text: fn(usize, i32) -> String,
     /// A typed value for a setting.
     pub parse: fn(usize, &str) -> Option<i32>,
+    /// A setting shown other than it is stored, when its knob means something the parameters do not hold: the
+    /// values (the spec's settings, in order) and the setting's place give `Some(offset)` to show `stored - offset`
+    /// and to edit by the shown value (the stored one written is the shown plus the offset). Mango 12's gains: while
+    /// Link is on the out knob shows the effective output gain (the stored out less the in, what the output stage
+    /// runs at), so it follows the in knob and editing it moves the total by the same amount. `None`: every setting
+    /// shows its stored value.
+    pub shown: Option<fn(&[i32], usize) -> Option<i32>>,
     pub sound: fn(u32, &[i32]) -> Box<dyn Sound>,
     /// The sound rings on after the input stops (a delay line).
     pub rings: bool,
@@ -320,7 +328,7 @@ impl<K: Kind> Vst3Plugin for SmallFx<K> {
 mod tests {
     use super::*;
 
-    pub const SPECS: [&Spec; 11] = [
+    pub const SPECS: [&Spec; 12] = [
         soft_clipper::SPEC,
         fast_distortion::SPEC,
         balance::SPEC,
@@ -332,6 +340,7 @@ mod tests {
         flanger::SPEC,
         phaser::SPEC,
         crusher::SPEC,
+        twelve::SPEC,
     ];
 
     /// Every effect: ids unique, starts inside the ranges, a control per setting, the plugin ids distinct.
@@ -367,6 +376,7 @@ mod tests {
             <flanger::LemonFlanger as ClapPlugin>::CLAP_ID,
             <phaser::LemonPhaser as ClapPlugin>::CLAP_ID,
             <crusher::MangoCrusher as ClapPlugin>::CLAP_ID,
+            <twelve::MangoTwelve as ClapPlugin>::CLAP_ID,
         ];
         let classes = [
             <soft_clipper::LemonSoftClipper as Vst3Plugin>::VST3_CLASS_ID,
@@ -380,6 +390,7 @@ mod tests {
             <flanger::LemonFlanger as Vst3Plugin>::VST3_CLASS_ID,
             <phaser::LemonPhaser as Vst3Plugin>::VST3_CLASS_ID,
             <crusher::MangoCrusher as Vst3Plugin>::VST3_CLASS_ID,
+            <twelve::MangoTwelve as Vst3Plugin>::VST3_CLASS_ID,
         ];
         for i in 0..ids.len() {
             for j in i + 1..ids.len() {

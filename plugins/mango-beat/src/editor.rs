@@ -110,6 +110,9 @@ pub enum Cmd {
     DeletePoint(usize, usize, usize),
     /// A section's grid resets to its default line.
     ResetSection(usize),
+    /// A factory preset lands in a section's slot (the section, the slot, the index in
+    /// `presets::TIME_PRESETS`/`VOL_PRESETS`).
+    Preset(usize, usize, usize),
     /// Slot clipboard: copy, paste and clear one section's slot.
     CopySlot(usize, usize),
     PasteSlot(usize, usize),
@@ -254,6 +257,13 @@ impl Logic {
         vec![Act::Repaint]
     }
 
+    /// A section's grid was hand-edited: its preset recipe (if any) is dropped — the grid is the player's from
+    /// here on, stretching with the cycle as drawn — and the shared grids hear the edit.
+    fn hand_edited(&mut self, sec: usize) -> Vec<Act> {
+        self.params.set_gen(sec, String::new());
+        self.grids_changed()
+    }
+
     /// The shown slot of a section, by the parameters.
     fn shown_slot(&self, sec: usize) -> usize {
         let id = if sec == view::TIME { "time_slot" } else { "vol_slot" };
@@ -325,7 +335,7 @@ impl Logic {
                 self.drag = Some(Drag::Point { sec, slot, i, beat: px, value: py, dx: 0.0, dy: 0.0 });
                 self.view.pressed = Some(t.clone());
                 acts.push(Act::Lock);
-                acts.extend(self.grids_changed());
+                acts.extend(self.hand_edited(sec));
             }
             (Target::Point(sec, slot, i), Btn::Right) => acts.push(Act::Menu(MenuReq::Point(*sec, *slot, *i), x, y)),
             (Target::Point(sec, slot, i), Btn::Left) if m.alt => {
@@ -389,7 +399,9 @@ impl Logic {
                 // twenty-fourths unless the drag holds Shift from the start.
                 let lock = ((acc_x.abs() > 3.0 || acc_y.abs() > 3.0)).then(|| acc_x.abs() >= acc_y.abs());
                 let mut x = beat + acc_x / POINT_PX;
-                let mut y = (value - acc_y / POINT_VPX).clamp(0.0, 1.0);
+                // The volume well drags up = more; the time well drags down = further into the past.
+                let dir = if sec == view::TIME { 1.0 } else { -1.0 };
+                let mut y = (value + dir * acc_y / POINT_VPX).clamp(0.0, 1.0);
                 if m.shift {
                     x = Self::snap_beat(x, true);
                 } else {
@@ -410,18 +422,20 @@ impl Logic {
                 self.drag = Some(Drag::Point { sec, slot, i, beat, value, dx: acc_x, dy: acc_y });
                 let t = self.view.pressed.clone();
                 self.hint = self.hint_for(t.as_ref());
-                return self.grids_changed();
+                return self.hand_edited(sec);
             }
             Drag::Tension { sec, slot, i, t, dy: acc_y } => {
                 let acc_y = acc_y + dy * f;
                 let curve = self.curve_mut(sec, slot);
                 if i < curve.pts.len() {
-                    curve.pts[i].t = (t - acc_y / TENSION_PX).clamp(-1.0, 1.0);
+                    // The handle follows the finger on either well's direction.
+                    let dir = if sec == view::TIME { 1.0 } else { -1.0 };
+                    curve.pts[i].t = (t + dir * acc_y / TENSION_PX).clamp(-1.0, 1.0);
                 }
                 self.drag = Some(Drag::Tension { sec, slot, i, t, dy: acc_y });
                 let t = self.view.pressed.clone();
                 self.hint = self.hint_for(t.as_ref());
-                return self.grids_changed();
+                return self.hand_edited(sec);
             }
         }
         let t = self.view.pressed.clone();
@@ -490,7 +504,7 @@ impl Logic {
             }
             MenuReq::Point(sec, slot, i) => {
                 let mut m = MenuDef::new(MenuStyle::Context);
-                m.head(&view::point_hint(*sec, *slot, *i, &self.grids), Cmd::None);
+                m.head(&view::point_hint(*sec, *slot, *i, &self.grids, view::cycle_of(&self.vals)), Cmd::None);
                 let cur = self
                     .curve_of(*sec, *slot)
                     .and_then(|c| c.pts.get(*i).copied())
@@ -511,6 +525,13 @@ impl Logic {
                     &format!("{} {}", if *sec == view::TIME { "Time" } else { "Volume" }, view::slot_name(*slot)),
                     Cmd::None,
                 );
+                // The section's factory presets — Gross Beat keeps the two sections' presets apart, and so does
+                // Mango Beat. A pick materializes the recipe for the current cycle into this slot.
+                let list = if *sec == view::TIME { crate::presets::TIME_PRESETS } else { crate::presets::VOL_PRESETS };
+                for (i, p) in list.iter().enumerate() {
+                    m.add(MenuItem::item(p.name), Cmd::Preset(*sec, *slot, i));
+                }
+                m.sep(Cmd::None);
                 m.add(MenuItem::item("Copy slot"), Cmd::CopySlot(*sec, *slot));
                 m.add(MenuItem::item("Paste slot").enabled(self.copied_slot.is_some()), Cmd::PasteSlot(*sec, *slot));
                 m.sep(Cmd::None);
@@ -547,7 +568,7 @@ impl Logic {
                 if let Some(p) = curve.pts.get_mut(i.min(n.saturating_sub(1))) {
                     p.m = mode as u8;
                 }
-                return self.grids_changed();
+                return self.hand_edited(sec);
             }
             Cmd::DeletePoint(sec, slot, i) => {
                 let curve = self.curve_mut(sec, slot);
@@ -556,7 +577,7 @@ impl Logic {
                     curve.normalize();
                 }
                 self.view.active = None;
-                return self.grids_changed();
+                return self.hand_edited(sec);
             }
             Cmd::ResetSection(sec) => {
                 if sec == view::TIME {
@@ -564,7 +585,20 @@ impl Logic {
                 } else {
                     self.grids.volume = Default::default();
                 }
-                return self.grids_changed();
+                return self.hand_edited(sec);
+            }
+            Cmd::Preset(sec, slot, i) => {
+                let list = if sec == view::TIME { crate::presets::TIME_PRESETS } else { crate::presets::VOL_PRESETS };
+                if let Some(p) = list.get(i) {
+                    let cycle = crate::params::CYCLE_BEATS[(self.vals.plain("cycle").round() as i32).clamp(0, 3) as usize];
+                    let slot = slot.min(3);
+                    if let Some(c) = crate::presets::materialize(p.recipe, cycle) {
+                        *self.curve_mut(sec, slot) = c;
+                        self.params.set_gen(sec, crate::presets::gen_for(slot, p.recipe));
+                        return self.grids_changed();
+                    }
+                }
+                return vec![Act::Repaint];
             }
             Cmd::CopySlot(sec, slot) => {
                 self.copied_slot = self.curve_of(sec, slot);
@@ -572,12 +606,12 @@ impl Logic {
             Cmd::PasteSlot(sec, slot) => {
                 if let Some(c) = self.copied_slot.clone() {
                     *self.curve_mut(sec, slot) = c;
-                    return self.grids_changed();
+                    return self.hand_edited(sec);
                 }
             }
             Cmd::ClearSlot(sec, slot) => {
                 *self.curve_mut(sec, slot) = Curve::default();
-                return self.grids_changed();
+                return self.hand_edited(sec);
             }
         }
         vec![Act::Repaint]
@@ -738,7 +772,8 @@ mod tests {
         assert!(l.params.grid.version() > seen);
     }
 
-    /// The point and section menus offer the shapes, delete, copy and clear; picking them lands in the grids.
+    /// The point and section menus offer the shapes, the presets, delete, copy and clear; picking them lands in
+    /// the grids.
     #[test]
     fn menus_edit_the_grids() {
         let mut l = logic();
@@ -757,6 +792,17 @@ mod tests {
         assert_eq!(l.grids.time[0].pts.len(), 1);
         l.pick(&MenuReq::Section(view::TIME, 0), Cmd::ClearSlot(view::TIME, 0), 0.0, 0.0);
         assert!(l.grids.time[0].pts.is_empty(), "cleared to the default line");
+        // The section menu carries the section's factory presets: a pick materializes into the slot and stores
+        // the recipe; a hand edit afterwards drops it again.
+        let m = l.menu(&MenuReq::Section(view::VOL, 1));
+        assert!(m.find("Trance Gate 1-8").is_some(), "the volume presets are there");
+        assert!(m.find("Half Time").is_none(), "the time presets stay out of the volume menu");
+        l.pick(&MenuReq::Section(view::VOL, 1), Cmd::Preset(view::VOL, 1, 3), 0.0, 0.0);
+        assert_eq!(l.grids.volume[1].pts.len(), 64, "Trance Gate 1-8 over the four-bar default");
+        assert_eq!(l.params.gen_of(view::VOL), crate::presets::gen_for(1, crate::presets::VOL_PRESETS[3].recipe));
+        l.pick(&MenuReq::Section(view::VOL, 1), Cmd::ClearSlot(view::VOL, 1), 0.0, 0.0);
+        assert!(l.grids.volume[1].pts.is_empty());
+        assert!(l.params.gen_of(view::VOL).is_empty(), "a hand edit clears the recipe");
         // The About menu comes from the wordmark.
         let (x, y) = centre(&l, &Target::Logo);
         assert!(matches!(l.down(x, y, Btn::Left, Mods::default(), false).last(), Some(Act::Menu(MenuReq::About, _, _))));
@@ -803,9 +849,9 @@ mod tests {
         save(&mut l, "beat_default", 1.0);
         save(&mut l, "beat_default_x2", 2.0);
         // A half-time time grid and a trance gate.
-        l.grids.time[0] = crate::grid::Curve { pts: vec![crate::grid::Pt::new(0.0, 0.375, 0.6, 0), crate::grid::Pt::new(1.0, 0.0, 0.0, 12)] };
-        l.grids.volume[0] = crate::dsp::gate(2, 16.0);
-        l.hint = "Time A, point 1: beat 12/24, -2.0x".into();
+        l.grids.time[0] = crate::grid::Curve { pts: vec![crate::grid::Pt::new(0.0, 0.0, 0.0, 0), crate::grid::Pt::new(1.0, 1.0, 0.0, 0)] };
+        l.grids.volume[0] = crate::dsp::gate(2.0, 16.0);
+        l.hint = "Time A, point 2: beat 4.00, 2 bars".into();
         save(&mut l, "beat_halftime_gate", 1.0);
     }
 }

@@ -7,8 +7,8 @@
 //! through the shared grids.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 use nih_plug::prelude::*;
 use os_plugkit::live::LiveEdits;
@@ -52,6 +52,9 @@ pub const RANGES: [(i32, i32); PARAMS] = [(0, 10000), (0, 10000), (0, 3), (0, 3)
 
 /// The state field the grids travel in.
 pub const GRID_FIELD: &str = "grid";
+/// The state fields a factory preset's recipe travels in (one per section; empty = hand-drawn, no recipe).
+pub const TGEN_FIELD: &str = "tgen";
+pub const VGEN_FIELD: &str = "vgen";
 
 pub fn index(id: &str) -> Option<usize> {
     DEFS.iter().position(|d| d.id == id)
@@ -83,6 +86,8 @@ pub struct BeatParams {
     pub live: Arc<LiveEdits>,
     /// Bumped whenever the grids move from outside (the editor keeps its own copy through it).
     pub grid_version: Arc<AtomicU64>,
+    /// The sections' preset recipes ("" = hand-drawn); the grids re-materialize from them when the cycle moves.
+    pub gens: Arc<Mutex<[String; 2]>>,
 }
 
 impl Default for BeatParams {
@@ -109,11 +114,21 @@ impl Default for BeatParams {
                     }))
             })
             .collect();
-        BeatParams { p, grid: Arc::default(), live: Arc::default(), grid_version: Arc::default() }
+        BeatParams { p, grid: Arc::default(), live: Arc::default(), grid_version: Arc::default(), gens: Arc::new(Mutex::new([String::new(), String::new()])) }
     }
 }
 
 impl BeatParams {
+    /// A section's preset recipe ("" = none; `TIME` is 0, `VOL` 1).
+    pub fn gen_of(&self, sec: usize) -> String {
+        self.gens.lock().unwrap_or_else(|e| e.into_inner())[sec.min(1)].clone()
+    }
+
+    /// Puts a section's preset recipe in ("" clears it: the grid is hand-drawn from here on).
+    pub fn set_gen(&self, sec: usize, recipe: String) {
+        self.gens.lock().unwrap_or_else(|e| e.into_inner())[sec.min(1)] = recipe;
+    }
+
     /// Setting `k`'s value for the sound (an editor edit the host has not confirmed yet wins).
     pub fn v(&self, k: usize) -> i32 {
         self.live.value(&self.p[k])
@@ -137,7 +152,12 @@ unsafe impl Params for BeatParams {
     }
 
     fn serialize_fields(&self) -> BTreeMap<String, String> {
-        BTreeMap::from([(GRID_FIELD.to_string(), self.grid.load().to_json())])
+        let gens = self.gens.lock().unwrap_or_else(|e| e.into_inner());
+        BTreeMap::from([
+            (GRID_FIELD.to_string(), self.grid.load().to_json()),
+            (TGEN_FIELD.to_string(), gens[0].clone()),
+            (VGEN_FIELD.to_string(), gens[1].clone()),
+        ])
     }
 
     fn deserialize_fields(&self, serialized: &BTreeMap<String, String>) {
@@ -150,6 +170,10 @@ unsafe impl Params for BeatParams {
                 None => nih_debug_assert_failure!("Mango Beat: the saved grids did not read"),
             }
         }
+        let gens = self.gens.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gens = gens;
+        gens[0] = serialized.get(TGEN_FIELD).cloned().unwrap_or_default();
+        gens[1] = serialized.get(VGEN_FIELD).cloned().unwrap_or_default();
     }
 }
 

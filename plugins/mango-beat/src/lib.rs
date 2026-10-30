@@ -14,6 +14,7 @@ pub mod dsp;
 pub mod editor;
 pub mod grid;
 pub mod params;
+pub mod presets;
 pub mod view;
 mod window;
 
@@ -45,11 +46,13 @@ pub struct MangoBeat {
     dsp: Option<dsp::Beat>,
     /// The grid version the sound has seen (the editor's edits move it).
     grids_seen: u64,
+    /// The cycle the grids were materialized for (a move re-materializes the sections' preset recipes).
+    cycle_seen: f32,
 }
 
 impl Default for MangoBeat {
     fn default() -> Self {
-        MangoBeat { params: Arc::new(BeatParams::default()), shared: Arc::new(Shared::default()), dsp: None, grids_seen: u64::MAX }
+        MangoBeat { params: Arc::new(BeatParams::default()), shared: Arc::new(Shared::default()), dsp: None, grids_seen: u64::MAX, cycle_seen: 0.0 }
     }
 }
 
@@ -63,6 +66,32 @@ impl MangoBeat {
             if let Some(d) = &mut self.dsp {
                 d.set_grids(g);
             }
+        }
+    }
+
+    /// The cycle moved: the sections with a preset recipe materialize their grids again for the new length (a
+    /// hand-drawn grid stretches as drawn). Runs on the audio thread when the host or the editor moved the
+    /// cycle — a rare user action taking the same shared-state lock the editor's edits take.
+    fn rematerialize(&mut self) {
+        let cycle = self.cycle_seen;
+        let mut g = self.params.grid.load();
+        let mut moved = false;
+        for (sec, text) in [(0usize, self.params.gen_of(0)), (1usize, self.params.gen_of(1))] {
+            if text.is_empty() {
+                continue;
+            }
+            let Some((slot, recipe)) = crate::presets::parse_gen(&text) else { continue };
+            let Some(c) = crate::presets::materialize(&recipe, cycle) else { continue };
+            if sec == 0 {
+                g.time[slot.min(3)] = c;
+            } else {
+                g.volume[slot.min(3)] = c;
+            }
+            moved = true;
+        }
+        if moved {
+            self.params.grid.store(g);
+            // grids_seen stays where it was: the next sync_grids carries the new grids into the sound.
         }
     }
 }
@@ -94,6 +123,7 @@ impl Plugin for MangoBeat {
         self.grids_seen = u64::MAX;
         let rate = config.sample_rate.round() as u32;
         let s = self.params.settings();
+        self.cycle_seen = s.cycle_beats;
         match &mut self.dsp {
             // nih-plug initializes the plugin again after the host loads a state: keep the ring, take the grids.
             Some(d) => {
@@ -117,8 +147,13 @@ impl Plugin for MangoBeat {
 
     fn process(&mut self, buffer: &mut Buffer, _aux: &mut AuxiliaryBuffers, ctx: &mut impl ProcessContext<Self>) -> ProcessStatus {
         self.sync_grids();
-        let Some(dsp) = &mut self.dsp else { return ProcessStatus::Normal };
         let s = self.params.settings();
+        // The cycle moved (the editor's picker, a project load): the recipes materialize for the new length.
+        if self.cycle_seen != s.cycle_beats {
+            self.cycle_seen = s.cycle_beats;
+            self.rematerialize();
+        }
+        let Some(dsp) = &mut self.dsp else { return ProcessStatus::Normal };
         dsp.set(&s);
         let t = ctx.transport();
         if let Some(bpm) = t.tempo {
@@ -184,8 +219,8 @@ mod tests {
         assert_eq!(GridState::from_json(out.get(GRID_FIELD).unwrap()).unwrap(), g);
     }
 
-    /// The factory presets (written by `examples/presets.rs`) hold states this plugin reads: the header names the
-    /// plugin, the blob carries its length prefix and the grids parse.
+    /// A factory preset's grids hold the recipe's materialization: the header names the plugin, the blob carries
+    /// its length prefix and the grids parse.
     #[test]
     fn factory_presets_hold_readable_grids() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/os-app/factory-presets/Mango Beat");
@@ -212,11 +247,14 @@ mod tests {
             let grids = GridState::from_json(grid).expect("grids read");
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             if name == "Half Time.ospreset" {
-                assert_eq!(grids.time[0].pts.len(), 1);
-                assert!((GridState::rate_of_y(grids.time[0].pts[0].y) - 0.5).abs() < 1e-3, "half time plays at half");
+                assert_eq!(grids.time[0].pts.len(), 2, "a straight offset slope");
+                assert!((GridState::offset_of_y(grids.time[0].pts[1].y) - 8.0).abs() < 1e-4, "half time over the four-bar default reaches the well's bottom");
             }
             if name == "Trance Gate 1-8.ospreset" {
                 assert_eq!(grids.volume[0].pts.len(), 64, "two on-off steps a beat over the four-bar cycle");
+            }
+            if name == "Sidechain Pump.ospreset" {
+                assert_eq!(grids.volume[0].pts.len(), 12, "four dips over the four-bar default");
             }
         }
         assert!(count >= 10, "the factory presets are there ({count})");
@@ -228,7 +266,7 @@ mod tests {
         let mut p = MangoBeat::default();
         p.dsp = Some(dsp::Beat::new(48000));
         let mut g = GridState::default();
-        g.volume[0] = dsp::gate(2, 16.0);
+        g.volume[0] = dsp::gate(2.0, 16.0);
         p.params.grid.store(g);
         p.grids_seen = u64::MAX;
         p.sync_grids();

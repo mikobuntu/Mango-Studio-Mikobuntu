@@ -11,7 +11,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-/// One envelope point: `x` across the beat (0..1), `y` the value (0..1), `t` the segment's tension (-1..1) and `m`
+/// The time grid's height in beats (Gross Beat's mapping panel: 8 beats = two bars, the depth of its rolling
+/// buffer). A point's `y` maps linearly: the top edge is the live sound, the bottom edge `PANEL_BEATS` back.
+pub const PANEL_BEATS: f32 = 8.0;
+
+/// One envelope point: `x` across the cycle (0..1), `y` the value (0..1), `t` the segment's tension (-1..1) and `m`
 /// the segment's shape (`Mode`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Pt {
@@ -404,27 +408,15 @@ impl GridState {
         Some(GridState { time: arr(v.get("time")?)?, volume: arr(v.get("volume")?)? })
     }
 
-    /// A rate's position on the time grid: the vertical is exponential around the centre — 1x at the middle,
-    /// 16x at the top, a quarter of the sound at a quarter up from the bottom, and below that the same range
-    /// backwards (the bottom edge is full reverse). Forward rates below a quarter clamp to the quarter line.
-    pub fn y_of_rate(rate: f32) -> f32 {
-        let r = rate.max(-16.0).min(16.0);
-        if r >= 0.0 {
-            (0.5 + r.max(1.0 / 16.0).log2() / 8.0).clamp(0.25, 1.0)
-        } else {
-            (0.25 - (-r).max(1.05).log2() / 16.0).clamp(0.0, 0.25)
-        }
+    /// A time-grid position's offset in beats back from the live sound (Gross Beat's mapping panel: the top edge
+    /// is the present, the bottom edge [`PANEL_BEATS`] beats into the past — two bars, the depth of its buffer).
+    pub fn offset_of_y(y: f32) -> f32 {
+        y.clamp(0.0, 1.0) * PANEL_BEATS
     }
 
-    /// The rate a time grid position plays at (see [`GridState::y_of_rate`](Self::y_of_rate)): the centre is 1x,
-    /// the top 16x, a quarter up from the bottom a quarter speed, under it backwards down to -16x at the bottom.
-    pub fn rate_of_y(y: f32) -> f32 {
-        let y = y.clamp(0.0, 1.0);
-        if y >= 0.25 {
-            2f32.powf(8.0 * (y - 0.5))
-        } else {
-            -2f32.powf(16.0 * (0.25 - y))
-        }
+    /// Where an offset in beats sits on the time grid (see [`GridState::offset_of_y`](Self::offset_of_y)).
+    pub fn y_of_offset(offset: f32) -> f32 {
+        (offset / PANEL_BEATS).clamp(0.0, 1.0)
     }
 }
 
@@ -517,22 +509,17 @@ mod tests {
         assert_eq!(moved.pts[0].x, 0.0, "the first point pins at 0");
     }
 
-    /// The rate mapping: centre 1x, an eighth up 2x, a quarter up 4x, the top 16x, half speed a quarter down
-    /// from the centre, a quarter speed at the quarter line, the bottom full backwards.
+    /// The offset mapping: the top edge is the live sound, the bottom edge two bars back, a quarter of the well
+    /// a half bar, and values clamp inside.
     #[test]
-    fn rate_mapping_is_exponential_around_the_centre() {
-        assert!((GridState::rate_of_y(0.5) - 1.0).abs() < 1e-6);
-        assert!((GridState::rate_of_y(0.625) - 2.0).abs() < 1e-4, "an eighth up doubles");
-        assert!((GridState::rate_of_y(0.75) - 4.0).abs() < 1e-3);
-        assert!((GridState::rate_of_y(1.0) - 16.0).abs() < 1e-2, "the top is 16x");
-        assert!((GridState::rate_of_y(0.375) - 0.5).abs() < 1e-4, "half speed sits under the centre");
-        assert!((GridState::rate_of_y(0.25) - 0.25).abs() < 1e-4, "the quarter line is a quarter speed");
-        assert!(GridState::rate_of_y(0.0) < -15.0, "the bottom is full backwards");
-        assert!((GridState::y_of_rate(1.0) - 0.5).abs() < 1e-6, "the sound's own speed sits at the centre");
-        assert!((GridState::y_of_rate(2.0) - 0.625).abs() < 1e-4);
-        assert!((GridState::y_of_rate(0.5) - 0.375).abs() < 1e-4, "half speed sits under the centre");
-        assert!(GridState::y_of_rate(-1.0) < 0.25, "backwards rates sit under the quarter line");
-        assert!(GridState::y_of_rate(-1.0) >= 0.0);
+    fn offset_mapping_is_linear_in_beats() {
+        assert_eq!(GridState::offset_of_y(0.0), 0.0, "the top edge is the live sound");
+        assert!((GridState::offset_of_y(0.5) - 4.0).abs() < 1e-5, "the middle is a bar back");
+        assert!((GridState::offset_of_y(1.0) - 8.0).abs() < 1e-5, "the bottom edge is two bars back");
+        assert!((GridState::offset_of_y(0.125) - 1.0).abs() < 1e-5, "an eighth down is a beat");
+        assert!((GridState::y_of_offset(4.0) - 0.5).abs() < 1e-6);
+        assert_eq!(GridState::y_of_offset(-1.0), 0.0, "before the present clamps to the top");
+        assert_eq!(GridState::y_of_offset(99.0), 1.0, "past the buffer clamps to the bottom");
     }
 
     /// The JSON round trip keeps every point.

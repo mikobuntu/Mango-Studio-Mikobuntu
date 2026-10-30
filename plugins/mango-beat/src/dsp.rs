@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // This file is part of Lemon Studio: https://github.com/ItsAlphaNeon/Lemon-Studio
 
-//! Mango Beat's sound: a tape-style time section and a gate, both driven by the envelope grids.
+//! Mango Beat's sound: Gross Beat's time section and a gate, both driven by the envelope grids.
 //!
-//! The time section writes the input into a ring and reads it back at the rate the time grid asks for: the read
-//! head falls behind at slow rates, catches up at fast ones and walks backwards under the grid's centre, so
-//! half-time, double-time, tape-stop, reverse and scratch are all one mechanism. The volume section multiplies the
-//! sound by the volume grid, smoothed a half millisecond so gates do not click. With no grid in a section the
-//! section is transparent, so a fresh Mango Beat passes the sound through untouched.
+//! The time section keeps the input in a ring and reads it back where the time grid says, Gross Beat's way: the
+//! grid is an offset in beats back from the live sound, so a horizontal line plays at the sound's own speed (a
+//! plain delay), a down slope falls behind the present — at one beat a beat it pauses, past that angle it walks
+//! backwards — and a Hold step repositions the read head at once, which is the beat-repeat jump. The volume
+//! section multiplies the sound by the volume grid, smoothed a half millisecond so gates do not click. With no
+//! grid in a section the section is transparent, so a fresh Mango Beat passes the sound through untouched.
 //!
 // spec: plugins/mango-beat.md (§3 sound)
 
@@ -62,7 +63,7 @@ pub struct Beat {
     hist_r: Vec<f32>,
     /// The next write position in the ring.
     write: usize,
-    /// The read head's distance behind the write head, in frames.
+    /// The read head's distance behind the write head, in frames: the time grid's offset, directly.
     d: f64,
     /// Where in the envelope cycle the envelopes are (0..1; the cycle is `Settings::cycle_beats` beats long).
     phase: f64,
@@ -138,12 +139,10 @@ impl Beat {
         self.gain = 1.0;
     }
 
-    /// The rate the time grid asks for at `phase`: an empty grid is the sound's own speed.
-    fn rate_at(&self, phase: f64) -> f64 {
-        match self.grids.time[self.settings.time_slot.min(3)].value_at(phase) {
-            Some(y) => f64::from(GridState::rate_of_y(y)),
-            None => 1.0,
-        }
+    /// The offset the time grid asks for at `phase`, in panel units 0..1 (0 is the live sound, 1 is
+    /// [`crate::grid::PANEL_BEATS`] beats back): an empty grid is the live sound.
+    fn offset_at(&self, phase: f64) -> f32 {
+        self.grids.time[self.settings.time_slot.min(3)].value_at(phase).unwrap_or(0.0)
     }
 
     /// The gain the volume grid asks for at `phase`: an empty grid is wide open.
@@ -161,11 +160,6 @@ impl Beat {
         let Some(ts) = transport else { return self.process_free(l, r, frames) };
         let bps = if self.bpm > 0.0 { self.bpm / 60.0 / f64::from(self.rate) } else { 0.0 };
         if ts.playing {
-            // A start or a jump puts the read head back at the present (the envelopes follow the host's beats).
-            let jumped = !self.playing || self.next_beats.is_none_or(|n| (n - ts.beats).abs() > 1e-3);
-            if jumped {
-                self.d = MIN_D;
-            }
             self.playing = true;
             self.next_beats = Some(ts.beats + frames as f64 * bps);
             // The envelopes follow the host's beats through the cycle: beat 0 of the song and every `cycle` beats
@@ -197,7 +191,6 @@ impl Beat {
                 phase += bps / cycle;
                 phase = phase.rem_euclid(1.0);
             }
-            let rate = if time_on { self.rate_at(phase) } else { 1.0 };
             let target = if vol_on { self.gain_at(phase) } else { 1.0 };
             // The gate glides to its target so steps do not click.
             self.gain += (target - self.gain) * self.smooth_k;
@@ -206,11 +199,14 @@ impl Beat {
             self.hist_l[self.write] = il;
             self.hist_r[self.write] = ir;
             self.write = (self.write + 1) & mask;
-            // The read head: slower rates fall behind, faster catch up, backwards walk further back.
-            if time_on {
-                self.d += 1.0 - rate;
-                self.d = self.d.clamp(MIN_D, MAX_D);
-            } else {
+            // The read head sits where the grid says, Gross Beat's way: the grid is an offset in beats back from
+            // the live sound, so a horizontal line plays at the sound's own speed, a down slope falls behind (at
+            // the pause angle it stops, steeper it walks backwards) and a Hold step repositions the head at once.
+            // Past the ring's depth the head stalls at the buffer's bottom, as Gross Beat's two-bar buffer does.
+            if time_on && bps > 0.0 {
+                let offset = f64::from(self.offset_at(phase)) * f64::from(crate::grid::PANEL_BEATS);
+                self.d = (offset / bps).clamp(MIN_D, MAX_D);
+            } else if !time_on {
                 self.d = MIN_D;
             }
             let (mut out_l, mut out_r) = if time_on {
@@ -241,16 +237,11 @@ impl Beat {
 // ---------------------------------------------------------------------------------------------------------------
 // Presets' grids (shared with the factory preset generator)
 
-/// A time grid that plays at one rate everywhere (`rate` in x, 0.375 = half).
-pub fn constant_time(rate: f32) -> crate::grid::Curve {
-    crate::grid::Curve::constant(GridState::y_of_rate(rate))
-}
-
-/// A gate grid of `steps` equal on-off steps per beat across a `cycle_beats`-beat cycle (`gate(2, 16.0)` is the
-/// classic eighth-note trance gate over the four-bar default cycle).
-pub fn gate(steps: usize, cycle_beats: f32) -> crate::grid::Curve {
+/// A gate grid of `steps` equal on-off steps per beat across a `cycle_beats`-beat cycle (`gate(2.0, 16.0)` is
+/// the classic eighth-note trance gate over the four-bar default cycle; `gate(1.0, ..)` gates quarter notes).
+pub fn gate(steps: f32, cycle_beats: f32) -> crate::grid::Curve {
     let hold = Mode::Hold as u8;
-    let total = (steps.max(1) as f32 * cycle_beats.max(0.5)).round() as usize;
+    let total = ((steps.max(0.125) * cycle_beats.max(0.5)).round() as usize).max(1);
     let step = 1.0 / total as f32;
     let mut pts = Vec::new();
     for k in 0..total {
@@ -285,69 +276,137 @@ mod tests {
         assert_eq!(r, ir);
     }
 
-    /// Half time plays the past at half speed: a rising ramp comes out rising half as fast (each input frame lands
-    /// across two output frames, within the linear interpolation's reach).
+    /// A horizontal time line delays the sound by the offset it sits at, at the sound's own speed: a line one
+    /// beat down (an eighth of the well) is a one-beat delay.
+    #[test]
+    fn a_horizontal_line_delays_the_sound() {
+        let mut b = beat();
+        b.set(&Settings { cycle_beats: 4.0, ..Settings::default() });
+        let mut g = GridState::default();
+        g.time[0] = Curve { pts: vec![Pt::new(0.0, 0.125, 0.0, Mode::Single as u8)] };
+        b.set_grids(g);
+        let n = 24000; // a beat at 120 bpm and 48 kHz
+        let mut l: Vec<f32> = (0..2 * n).map(|i| i as f32 / (2 * n) as f32).collect();
+        let mut r = vec![0.0; 2 * n];
+        b.process(&mut l, &mut r, Some(TransportStep { playing: true, beats: 0.0 }));
+        // Past the delay the output is the input from a beat ago.
+        let k = n + 5000;
+        let want = (k - n) as f32 / (2 * n) as f32;
+        assert!((l[k] - want).abs() < 0.01, "one beat behind: {} vs {want}", l[k]);
+    }
+
+    /// Half time: a slope that falls behind at half a beat a beat plays the past at half the sound's speed.
     #[test]
     fn half_time_plays_half_as_fast() {
         let mut b = beat();
+        b.set(&Settings { cycle_beats: 4.0, ..Settings::default() });
         let mut g = GridState::default();
-        g.time[0] = constant_time(0.5);
+        // Half speed's offset slope over a one-bar cycle: (1 - 0.5) * 4 beats over the well's 8 = a quarter down.
+        g.time[0] = Curve {
+            pts: vec![Pt::new(0.0, 0.0, 0.0, Mode::Single as u8), Pt::new(1.0, 0.25, 0.0, Mode::Single as u8)],
+        };
         b.set_grids(g);
-        let n = 512;
+        let n = 24000;
         let mut l: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
         let mut r = vec![0.0; n];
         b.process(&mut l, &mut r, Some(TransportStep { playing: true, beats: 0.0 }));
-        // After a moment the output rises at about half the input's slope.
+        // The output rises at about half the input's slope.
         let slope = (l[400] - l[300]) / 100.0;
-        assert!(slope > 0.0006 && slope < 0.0014, "slope {slope}");
+        assert!(slope > 0.000012 && slope < 0.000032, "slope {slope}");
     }
 
-    /// Double time catches up with the past at twice the speed: after a slow passage has built the head up, a
-    /// fast grid drains it at twice the input's rate (a live sound itself cannot be overtaken, so the test first
-    /// runs half time to fill the past).
+    /// Double time catches up with the past: a slope rising a beat a beat plays at twice the sound's speed (a
+    /// live sound itself cannot be overtaken, so the slope burns the backlog it is given).
     #[test]
     fn double_time_plays_twice_as_fast() {
         let mut b = beat();
+        b.set(&Settings { cycle_beats: 4.0, ..Settings::default() });
+        let n = 24000; // a beat
+        // Two beats play with the head held two beats down (the backlog builds in the ring).
         let mut g = GridState::default();
-        g.time[0] = constant_time(0.5);
+        g.time[0] = Curve { pts: vec![Pt::new(0.0, 0.25, 0.0, Mode::Single as u8)] };
         b.set_grids(g);
-        let n = 512;
-        let mut l: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
-        let mut r = vec![0.0; n];
+        let mut l: Vec<f32> = (0..2 * n).map(|i| i as f32 / n as f32).collect();
+        let mut r = vec![0.0; 2 * n];
         b.process(&mut l, &mut r, Some(TransportStep { playing: true, beats: 0.0 }));
-        // Now the fast grid: the head runs down its backlog at twice the input's rate.
+        // Then the catch-up slope, entered where the head sits (two beats down at the cycle's half): from there
+        // to the present over the second half of the cycle is a beat a beat of catch-up, twice the speed.
         let mut g = GridState::default();
-        g.time[0] = constant_time(2.0);
-        b.set_grids(g);
-        let mut l: Vec<f32> = (n..2 * n).map(|i| i as f32 / n as f32).collect();
-        let mut r = vec![0.0; n];
-        // The beats continue exactly where the first block said (a jump would reposition the head).
-        let bps = 1.0 / 24000.0;
-        b.process(&mut l, &mut r, Some(TransportStep { playing: true, beats: n as f64 * bps }));
-        let slope = (l[250] - l[50]) / 200.0;
-        assert!(slope > 0.0030 && slope < 0.0050, "slope {slope}");
-    }
-
-    /// A backwards rate walks the read head back through what just played: after half a beat at the sound's own
-    /// speed, the reverse half of the grid plays it descending (the cycle pinned to one beat keeps the numbers
-    /// small; the four-bar default gets its own test below).
-    #[test]
-    fn backwards_rates_play_the_past_in_reverse() {
-        let mut b = beat();
-        b.set(&Settings { cycle_beats: 1.0, ..Settings::default() });
-        let mut g = GridState::default();
-        let rev = GridState::y_of_rate(-1.0);
         g.time[0] = Curve {
-            pts: vec![Pt::new(0.0, 0.5, 0.0, Mode::Single as u8), Pt::new(0.5, rev, 0.0, Mode::Hold as u8), Pt::new(1.0, rev, 0.0, Mode::Hold as u8)],
+            pts: vec![Pt::new(0.0, 0.5, 0.0, Mode::Single as u8), Pt::new(1.0, 0.0, 0.0, Mode::Single as u8)],
         };
         b.set_grids(g);
-        let n = 24000; // a beat and a quarter at 120 bpm and 48 kHz
+        let mut l: Vec<f32> = (2 * n..4 * n).map(|i| i as f32 / n as f32).collect();
+        let mut r = vec![0.0; 2 * n];
+        b.process(&mut l, &mut r, Some(TransportStep { playing: true, beats: 2.0 }));
+        // Measure deep in the block, where the slope is in its steady two-times climb.
+        let slope = (l[3000] - l[1000]) / 2000.0;
+        assert!(slope > 0.000065 && slope < 0.000105, "slope {slope}");
+    }
+
+    /// Reverse: a slope falling two beats a beat walks the read head backwards at the sound's own speed, once
+    /// there is a past to walk through.
+    #[test]
+    fn a_reverse_slope_plays_the_past_backwards() {
+        let mut b = beat();
+        b.set(&Settings { cycle_beats: 4.0, ..Settings::default() });
+        let n = 24000; // a beat
+        // A beat of ramp plays live first (an empty grid is the present).
         let mut l: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
         let mut r = vec![0.0; n];
         b.process(&mut l, &mut r, Some(TransportStep { playing: true, beats: 0.0 }));
-        // Half a beat in, the grid turns around: the output descends through the recent past.
-        let slope = (l[14000] - l[12500]) / 1500.0;
-        assert!(slope < -0.00003, "slope {slope}");
+        // Then the reverse slope, entered at the cycle's start: the head walks back through the ramp.
+        let mut g = GridState::default();
+        g.time[0] = Curve {
+            pts: vec![Pt::new(0.0, 0.0, 0.0, Mode::Single as u8), Pt::new(1.0, 1.0, 0.0, Mode::Single as u8)],
+        };
+        b.set_grids(g);
+        let mut l = vec![1.0f32; n];
+        let mut r = vec![0.0; n];
+        b.process(&mut l, &mut r, Some(TransportStep { playing: true, beats: 4.0 }));
+        let slope = (l[2500] - l[1000]) / 1500.0;
+        assert!(slope < -0.000005, "the output descends through the past: {slope}");
+    }
+
+    /// A Hold step that jumps the offset down repositions the head at once: the classic half-bar repeat.
+    #[test]
+    fn a_hold_step_repeats_the_past() {
+        let mut b = beat();
+        b.set(&Settings { cycle_beats: 4.0, ..Settings::default() });
+        let mut g = GridState::default();
+        // Live for half the cycle, then a step two beats back: the first half of the bar plays twice.
+        g.time[0] = Curve {
+            pts: vec![
+                Pt::new(0.0, 0.0, 0.0, Mode::Hold as u8),
+                Pt::new(0.5, 0.0, 0.0, Mode::Hold as u8),
+                Pt::new(0.5, 0.25, 0.0, Mode::Hold as u8),
+            ],
+        };
+        b.set_grids(g);
+        let n = 96000; // the whole cycle
+        let mut l: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
+        let mut r = vec![0.0; n];
+        b.process(&mut l, &mut r, Some(TransportStep { playing: true, beats: 0.0 }));
+        // Three quarters in the head sits two beats back: the output is the sound of half a cycle ago.
+        let k = 72000;
+        let want = (k - 48000) as f32 / n as f32;
+        assert!((l[k] - want).abs() < 0.01, "reading two beats back: {} vs {want}", l[k]);
+    }
+
+    /// The head sits where the grid says after a transport jump: the host's beats map into the cycle.
+    #[test]
+    fn the_head_sits_where_the_grid_says() {
+        let mut b = beat();
+        b.set(&Settings { cycle_beats: 4.0, ..Settings::default() });
+        let mut g = GridState::default();
+        g.time[0] = Curve { pts: vec![Pt::new(0.0, 0.25, 0.0, Mode::Single as u8)] };
+        b.set_grids(g);
+        let n = 256;
+        let mut l = vec![0.5; n];
+        let mut r = vec![0.0; n];
+        b.process(&mut l, &mut r, Some(TransportStep { playing: true, beats: 10.0 }));
+        // The grid holds a quarter of the well down: two beats back, 48000 frames at this tempo.
+        assert!((b.d - 48000.0).abs() < 1.0, "two beats back after the jump: {}", b.d);
     }
 
     /// A gate closes and opens where its points say, smoothly (no step wider than the smoothing); the cycle is
@@ -372,38 +431,16 @@ mod tests {
         assert!(*l.last().unwrap() < 0.01, "closed by the end: {}", l.last().unwrap());
     }
 
-    /// A jump puts the read head back at the present: the first frames after the jump read what just played, not
-    /// the deep past the slow rate had run into.
-    #[test]
-    fn a_jump_repositions_the_read_head() {
-        let mut b = beat();
-        let mut g = GridState::default();
-        g.time[0] = constant_time(0.5);
-        b.set_grids(g);
-        let n = 480;
-        let mut l: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
-        let mut r = vec![0.0; n];
-        b.process(&mut l, &mut r, Some(TransportStep { playing: true, beats: 0.0 }));
-        assert!(b.d > 50.0, "half time ran the head into the past: {}", b.d);
-        // The jump: from a fresh position the first output frame is the sound of a moment ago.
-        let mut l = vec![0.5; n];
-        let mut r = vec![0.0; n];
-        b.process(&mut l, &mut r, Some(TransportStep { playing: true, beats: 10.0 }));
-        // With the reset the head reads the present (between the last of the old sound and the new one); deep in
-        // the past it would sit near 0.49.
-        assert!(l[0] > 0.6, "the head reset to the present: {}", l[0]);
-    }
-
     /// The tail free-runs without a transport word and stays finite (a stopped host still drains the ring).
     #[test]
     fn the_tail_free_runs_and_stays_finite() {
         let mut b = beat();
         let mut g = GridState::default();
-        g.time[0] = constant_time(0.5);
-        g.volume[0] = gate(2, 16.0);
+        g.time[0] = Curve { pts: vec![Pt::new(0.0, 0.125, 0.0, Mode::Single as u8)] };
+        g.volume[0] = gate(2.0, 16.0);
         b.set_grids(g);
         let n = 256;
-        let mut l: Vec<f32> = vec![0.5; n];
+        let mut l = vec![0.5; n];
         let mut r = vec![0.0; n];
         b.process(&mut l, &mut r, Some(TransportStep { playing: true, beats: 0.0 }));
         for _ in 0..8 {
@@ -456,8 +493,8 @@ mod tests {
     fn the_mixes_fade_their_sections_out() {
         let mut b = beat();
         let mut g = GridState::default();
-        g.time[0] = constant_time(0.5);
-        g.volume[0] = gate(2, 16.0);
+        g.time[0] = Curve { pts: vec![Pt::new(0.0, 0.25, 0.0, Mode::Single as u8)] };
+        g.volume[0] = gate(2.0, 16.0);
         b.set_grids(g);
         b.set(&Settings { time_mix: 0.0, vol_mix: 0.0, ..Settings::default() });
         let n = 256;
@@ -473,11 +510,11 @@ mod tests {
     /// cycle), and the cycle stretches the same pattern across its length.
     #[test]
     fn gate_steps_alternate() {
-        let g = gate(2, 1.0);
+        let g = gate(2.0, 1.0);
         assert_eq!(g.pts.len(), 4);
         assert!((g.value_at(0.1).unwrap() - 1.0).abs() < 1e-6, "open on the first half of the step");
         assert_eq!(g.value_at(0.3), Some(0.0), "closed on the second half");
-        assert_eq!(gate(2, 16.0).pts.len(), 64, "two steps a beat over the four-bar default: 32 on-off pairs");
+        assert_eq!(gate(2.0, 16.0).pts.len(), 64, "two steps a beat over the four-bar default: 32 on-off pairs");
     }
 
     /// The cycle stretches the envelopes: with the four-bar default, a gate that closes at the cycle's midpoint
@@ -500,5 +537,22 @@ mod tests {
         b.process(&mut l, &mut r, Some(TransportStep { playing: true, beats: 8.1 }));
         assert!(*l.last().unwrap() < 0.01, "closed after the cycle's midpoint: {}", l.last().unwrap());
     }
-}
 
+    /// Slower than the buffer: at an absurd tempo the head stalls at the ring's bottom and stays finite, as
+    /// Gross Beat's two-bar buffer runs out.
+    #[test]
+    fn slow_tempos_stall_at_the_buffer_bottom() {
+        let mut b = beat();
+        b.set_tempo(1.0);
+        b.set(&Settings { cycle_beats: 4.0, ..Settings::default() });
+        let mut g = GridState::default();
+        g.time[0] = Curve { pts: vec![Pt::new(0.0, 1.0, 0.0, Mode::Single as u8)] };
+        b.set_grids(g);
+        let n = 256;
+        let mut l: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
+        let mut r = vec![0.0; n];
+        b.process(&mut l, &mut r, Some(TransportStep { playing: true, beats: 0.0 }));
+        assert!((b.d - MAX_D).abs() < 1.0, "the head stalled at the buffer's bottom: {}", b.d);
+        assert!(l.iter().all(|v| v.is_finite() && v.abs() <= 1.0));
+    }
+}
