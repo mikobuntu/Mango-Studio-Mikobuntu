@@ -3,8 +3,9 @@
 // This file is part of Lemon Studio: https://github.com/ItsAlphaNeon/Lemon-Studio
 
 //! Mango Beat: Mango Studio's Gross Beat-style time manipulator as a VST3 / CLAP plugin (nih-plug). Two envelope
-//! grids per beat — time (the playback rate, from +16x through the centre's 1x down to -16x) and volume (the gate) —
-//! in four switchable slots each, drawn in the editor like the playlist draws automation.
+//! grids over a shared cycle — time (the playback rate, from +16x through the centre's 1x down to -16x) and
+//! volume (the gate) — in four switchable slots each, the cycle spanning half a bar through four bars, drawn in
+//! the editor like the playlist draws automation.
 //!
 // spec: plugins/mango-beat.md
 #![allow(semicolon_in_expressions_from_non_local_macros)]
@@ -215,7 +216,7 @@ mod tests {
                 assert!((GridState::rate_of_y(grids.time[0].pts[0].y) - 0.5).abs() < 1e-3, "half time plays at half");
             }
             if name == "Trance Gate 1-8.ospreset" {
-                assert_eq!(grids.volume[0].pts.len(), 4, "two on-off steps per beat");
+                assert_eq!(grids.volume[0].pts.len(), 64, "two on-off steps a beat over the four-bar cycle");
             }
         }
         assert!(count >= 10, "the factory presets are there ({count})");
@@ -227,7 +228,7 @@ mod tests {
         let mut p = MangoBeat::default();
         p.dsp = Some(dsp::Beat::new(48000));
         let mut g = GridState::default();
-        g.volume[0] = dsp::gate(2);
+        g.volume[0] = dsp::gate(2, 16.0);
         p.params.grid.store(g);
         p.grids_seen = u64::MAX;
         p.sync_grids();
