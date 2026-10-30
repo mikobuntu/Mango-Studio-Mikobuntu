@@ -12,8 +12,10 @@
 //! route picks what the converter hears (the stereo pair, a mono sum, one channel, the mid or the side — what it
 //! does not hear passes as it is), the gains set how hard it is hit and how loud it leaves (`Link` holds their
 //! total at the gain out, and while it is on the out knob shows the effective output gain, so it follows the in
-//! knob), then the mix. Not a recreation of an FL plugin: its state is its own (modelled on the
-//! E-mu SP-1200's converter and output stage, in the spirit of Wave Tracing's SP-950).
+//! knob), then the mix, and the shape picks the crush's edges: square, where the hold jumps as a sampler's
+//! sample-and-hold does, or round, where the output glides from one hold to the next on a raised cosine and the
+//! edges (much of the aliasing hash with them) soften. Not a recreation of an FL plugin: its state is its own
+//! (modelled on the E-mu SP-1200's converter and output stage, in the spirit of Wave Tracing's SP-950).
 
 use nih_plug::prelude::*;
 use os_theme::design::lemon as brand;
@@ -32,6 +34,7 @@ pub const LINK: usize = 5;
 pub const FILTER: usize = 6;
 pub const ROUTE: usize = 7;
 pub const MIX: usize = 8;
+pub const CRUSH: usize = 9;
 
 /// The routes, in the switch's order: what the converter hears.
 pub const STEREO: i32 = 0;
@@ -45,7 +48,7 @@ pub const SIDE: i32 = 7;
 
 pub const ROUTE_NAMES: &[&str] = &["Stereo", "Mono Sum", "Mono L", "Mono R", "Stereo L", "Stereo R", "Mid", "Side"];
 
-pub const SETTINGS: [Setting; 9] = [
+pub const SETTINGS: [Setting; 10] = [
     // Tenths of a semitone of detune, down from the 33 mark (0) to 78 (150); `Ext.` doubles it.
     Setting { id: "tune", name: "Tune", range: (0, 150), start: 0, magnet: Some(0) },
     Setting { id: "fine", name: "Fine", range: (0, 1), start: 0, magnet: None },
@@ -58,6 +61,8 @@ pub const SETTINGS: [Setting; 9] = [
     Setting { id: "filter", name: "Filter", range: (0, 99), start: 99, magnet: Some(99) },
     Setting { id: "route", name: "Route", range: (0, 7), start: STEREO, magnet: None },
     Setting { id: "mix", name: "Mix", range: (0, 100), start: 100, magnet: None },
+    // The crush's edges: the hold jumps (square) or glides to the next on a raised cosine (round).
+    Setting { id: "shape", name: "Shape", range: (0, 1), start: 0, magnet: None },
 ];
 
 const CARDS: [Card; 5] = [
@@ -68,7 +73,7 @@ const CARDS: [Card; 5] = [
     Card { x0: 436.0, x1: 612.0, y0: 28.0, y1: 187.0, heading: "MIX" },
 ];
 
-const CONTROLS: [Control; 9] = [
+const CONTROLS: [Control; 10] = [
     Control::Fader {
         id: "tune",
         x: 104.0,
@@ -88,6 +93,7 @@ const CONTROLS: [Control; 9] = [
     Control::Choice { id: "link", x: 384.0, top: 44.0, names: &["Off", "Link"] },
     Control::Knob { id: "filter", cx: 350.0, cy: 150.0, r: 16.0, caption: "FILTER", bipolar: false },
     Control::Knob { id: "mix", cx: 524.0, cy: 152.0, r: 15.0, caption: "MIX", bipolar: false },
+    Control::Choice { id: "shape", x: 448.0, top: 138.0, names: &["Square", "Round"] },
 ];
 
 pub const SPEC: &Spec = &Spec {
@@ -97,8 +103,10 @@ pub const SPEC: &Spec = &Spec {
     settings: &SETTINGS,
     version: None,
     any_version: false,
-    fields: &[],
-    tail: &[],
+    // The shape is the byte after the settings' ints, so the states saved before it are one byte short and read it
+    // as square: old sessions and projects keep their sound.
+    fields: &[0, 1, 2, 3, 4, 5, 6, 7, 8, crate::params::BYTE],
+    tail: &[0],
     size: (620, 214),
     cards: &CARDS,
     controls: &CONTROLS,
@@ -125,6 +133,7 @@ fn text(k: usize, v: i32) -> String {
         FILTER if v >= 99 => "Off".into(),
         FILTER => format!("{v}"),
         ROUTE => ROUTE_NAMES[v.clamp(0, 7) as usize].into(),
+        CRUSH => ["Square", "Round"][v.clamp(0, 1) as usize].into(),
         _ => format!("{v}%"),
     }
 }
@@ -162,6 +171,11 @@ fn parse(k: usize, s: &str) -> Option<i32> {
             Some(v.clamp(range.0, range.1))
         }
         ROUTE => ROUTE_NAMES.iter().position(|m| s.eq_ignore_ascii_case(m)).map(|i| i as i32),
+        CRUSH => match s.to_ascii_lowercase().as_str() {
+            "square" => Some(0),
+            "round" | "rounded" => Some(1),
+            _ => None,
+        },
         _ => {
             let v = leading_number(s)?.round() as i32;
             Some(v.clamp(range.0, range.1))
@@ -205,6 +219,12 @@ fn saturate(x: f32) -> f32 {
     (0.75 * x).tanh() / 0.75
 }
 
+/// The round shape's edge: a raised cosine from a hold to the next (0 at the one, 1 at the other), so the step's
+/// corners round off where the sample-and-hold's square jump would be.
+fn glide(u: f64) -> f64 {
+    0.5 - 0.5 * (std::f64::consts::PI * u.clamp(0.0, 1.0)).cos()
+}
+
 /// The filter's cutoff for a knob value (`rate` keeps it under half the rate).
 fn cutoff(k: i32, rate: f64) -> f64 {
     (100.0 * 130.2f64.powf(f64::from(k) / 98.0)).min(rate * 0.45)
@@ -238,11 +258,13 @@ struct Lane {
     taps: [[f64; 4]; 3],
     phase: f64,
     held: f32,
+    /// The hold before the current one, where a rounded edge glides from.
+    prev: f32,
 }
 
 impl Default for Lane {
     fn default() -> Self {
-        Lane { taps: [[0.0; 4]; 3], phase: 0.0, held: 0.0 }
+        Lane { taps: [[0.0; 4]; 3], phase: 0.0, held: 0.0, prev: 0.0 }
     }
 }
 
@@ -251,6 +273,8 @@ pub struct Twelve {
     rate: f64,
     route: i32,
     mix: f32,
+    /// The shape: the holds' edges jump (square) or glide (round).
+    rounded: bool,
     in_gain: f32,
     out_gain: f32,
     /// Host samples per clock tick.
@@ -268,6 +292,7 @@ impl Twelve {
             rate: f64::from(rate),
             route: STEREO,
             mix: 1.0,
+            rounded: false,
             in_gain: 1.0,
             out_gain: 1.0,
             inc: CLOCK / f64::from(rate),
@@ -285,6 +310,7 @@ impl Twelve {
         let get = |k: usize| v.get(k).copied().unwrap_or(SETTINGS[k].start).clamp(SETTINGS[k].range.0, SETTINGS[k].range.1);
         self.route = get(ROUTE);
         self.mix = get(MIX) as f32 / 100.0;
+        self.rounded = get(CRUSH) == 1;
         self.in_gain = 10f32.powf(get(IN) as f32 / 200.0);
         // Linked: the output gain follows the input gain down, so the total stays at the gain out (each knob keeps
         // to its own range).
@@ -318,10 +344,14 @@ impl Twelve {
         let l = &mut self.lanes[i];
         l.phase += self.inc;
         if l.phase >= 1.0 {
+            l.prev = l.held;
             l.held = quantize(s);
             l.phase -= 1.0;
         }
-        saturate(l.held)
+        // Square: the hold jumps to the new sample, as the sample-and-hold does. Round: the output glides from the
+        // hold before it to the new one across the clock period, so the edge is a raised cosine, not a jump.
+        let held = if self.rounded { l.prev + (l.held - l.prev) * glide(l.phase) as f32 } else { l.held };
+        saturate(held)
     }
 
     /// One block through the route's shape, the output gain and the mix.
@@ -409,7 +439,8 @@ fn screen(c: &mut Canvas, r: Rect, v: &[i32]) {
     let k = v.get(FILTER).copied().unwrap_or(99);
     let head = format!("TUNE {tune} · FILTER {}", if k >= 99 { "OFF".to_string() } else { format!("{k}") });
     c.text_clip(HEAD, r.x + 7.0, r.y + 5.0, r.w - 14.0, brand::TEXT, &head);
-    // Two cycles of a sine through the clock and the 12 bits: the staircase coarsens as the tune detunes.
+    // Two cycles of a sine through the clock and the 12 bits: the staircase coarsens as the tune detunes, and the
+    // shape picks its edges — the square hold's jump, or the round glide from one hold to the next.
     let (x0, x1) = (r.x + 8.0, r.right() - 8.0);
     let (top, bot) = (r.y + 22.0, r.bottom() - 22.0);
     let cy = ((top + bot) / 2.0).round();
@@ -417,14 +448,16 @@ fn screen(c: &mut Canvas, r: Rect, v: &[i32]) {
     c.fill_rect(Rect::span(x0, x1, cy, cy + 1.0), plug::GRID);
     let n = ((x1 - x0) as usize).max(2);
     let ppc = (13.0 * 2f64.powf(-d / 120.0)).max(3.0);
-    let pts: Vec<(f32, f32)> = (0..=n)
-        .map(|i| {
-            let u = i as f64 / n as f64;
-            let holds = (u * 2.0 * ppc).floor();
-            let y = (0.8 * (std::f64::consts::TAU * holds / ppc).sin() * 2048.0).round() / 2048.0;
-            (x0 + (x1 - x0) * u as f32, cy - (y * f64::from(half) / 0.9) as f32)
-        })
-        .collect();
+    let rounded = v.get(CRUSH).copied().unwrap_or(SETTINGS[CRUSH].start) == 1;
+    let level = |holds: f64| (0.8 * (std::f64::consts::TAU * holds / ppc).sin() * 2048.0).round() / 2048.0;
+    let at = |u: f64| {
+        let holds = (u * 2.0 * ppc).floor();
+        let y =
+            if rounded { level(holds - 1.0) + (level(holds) - level(holds - 1.0)) * glide(holds.fract()) } else { level(holds) };
+        cy - (y * f64::from(half) / 0.9) as f32
+    };
+    let pts: Vec<(f32, f32)> =
+        (0..=n).map(|i| { let u = i as f64 / n as f64; (x0 + (x1 - x0) * u as f32, at(u)) }).collect();
     c.polyline(&pts, 1.5, brand::MAIN);
     let clock = CLOCK * 2f64.powf(-d / 120.0);
     c.text_center(FOOT, Rect::new(r.x, r.bottom() - 16.0, r.w, 12.0), plug::DIM, &format!("12-BIT · {:.1}KHZ", clock / 1000.0));
@@ -463,6 +496,8 @@ mod tests {
         assert_eq!([parse(FILTER, "off"), parse(FILTER, "84")], [Some(99), Some(84)]);
         assert_eq!([text(ROUTE, 0), text(ROUTE, 1), text(ROUTE, 7)], ["Stereo", "Mono Sum", "Side"]);
         assert_eq!(parse(ROUTE, "mono sum"), Some(1));
+        assert_eq!([text(CRUSH, 0), text(CRUSH, 1)], ["Square", "Round"]);
+        assert_eq!([parse(CRUSH, "square"), parse(CRUSH, "Round"), parse(CRUSH, "rounded")], [Some(0), Some(1), Some(1)]);
         assert_eq!([text(MIX, 100), text(MIX, 0)], ["100%", "0%"]);
         assert_eq!(parse(MIX, "40%"), Some(40));
     }
@@ -607,5 +642,62 @@ mod tests {
         assert_eq!(quantize(0.0001), 0.0);
         assert_eq!(quantize(3.0), 2047.0 / 2048.0);
         assert_eq!(quantize(-3.0), -1.0);
+    }
+
+    /// The square crush is what shipped before the shape: a sound from the settings without it plays exactly as its
+    /// twin with the shape at square, and the states saved before the switch (one byte short) read it as square, so
+    /// old sessions and projects keep their sound.
+    #[test]
+    fn the_shape_defaults_to_the_square_crush_it_shipped_with() {
+        let (n, rate) = (44100usize, 44100u32);
+        let run = |t: &mut Twelve| {
+            let mut l: Vec<f32> = (0..n).map(|i| 0.5 * (std::f32::consts::TAU * 997.0 * i as f32 / rate as f32).sin()).collect();
+            let mut r = l.clone();
+            t.process(&mut l, &mut r);
+            l
+        };
+        let before = run(&mut Twelve::new(rate, &[0, 1, 0, 0, 0, 0, 99, STEREO, 100]));
+        let after = run(&mut Twelve::new(rate, &[0, 1, 0, 0, 0, 0, 99, STEREO, 100, 0]));
+        assert_eq!(before, after);
+        // The state: the shape lives in the byte after the settings' ints. The states saved before it are one byte
+        // short (its tail missing) and read it as square.
+        let old = crate::params::default_state(SPEC);
+        assert_eq!(old.len(), 4 * (SETTINGS.len() - 1) + 1);
+        let stored = &old[..old.len() - 1]; // the shape's byte is the only addition
+        assert_eq!(crate::params::values_of(SPEC, stored)[CRUSH], 0);
+        assert!(!Twelve::new(rate, &crate::params::values_of(SPEC, stored)).rounded);
+        // Writing Round on the old state grows it by the byte, and it reads back.
+        let mut vals = SPEC.start();
+        vals[CRUSH] = 1;
+        let b = crate::params::to_fl(SPEC, &vals, stored);
+        assert_eq!(b.len(), stored.len() + 1);
+        assert_eq!(crate::params::values_of(SPEC, &b), vals);
+        assert!(Twelve::new(rate, &vals).rounded);
+    }
+
+    /// The round shape glides between the holds on a raised cosine instead of jumping: detuned to the 78 mark with
+    /// `Ext.` (the clock near 4.6 kHz) its worst step between neighbouring samples is a fraction of the square
+    /// crush's and the edge's second difference (the hash the ear hears as harsh) an order quieter, while it stays
+    /// on the sine and inside full scale.
+    #[test]
+    fn the_rounded_crush_glides_between_the_holds() {
+        assert_eq!([glide(0.0), glide(1.0)], [0.0, 1.0]);
+        assert!(glide(0.5).abs() - 0.5 < 1e-9);
+        let (n, rate) = (44100usize, 44100u32);
+        let run = |t: &mut Twelve| {
+            let mut l: Vec<f32> = (0..n).map(|i| 0.5 * (std::f32::consts::TAU * 220.0 * i as f32 / rate as f32).sin()).collect();
+            let mut r = l.clone();
+            t.process(&mut l, &mut r);
+            l
+        };
+        let square = run(&mut Twelve::new(rate, &[150, 0, 1, 0, 0, 0, 99, STEREO, 100, 0]));
+        let round = run(&mut Twelve::new(rate, &[150, 0, 1, 0, 0, 0, 99, STEREO, 100, 1]));
+        let worst = |v: &[f32]| v.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(worst(&round) < 0.3 * worst(&square), "{} {}", worst(&round), worst(&square));
+        let hash = |v: &[f32]| v.windows(3).map(|w| (w[2] - 2.0 * w[1] + w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(hash(&round) < 0.35 * hash(&square), "{} {}", hash(&round), hash(&square));
+        assert!(round.iter().all(|x| x.abs() <= 1.0));
+        let crossings = round.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
+        assert!((crossings as i64 - 220).abs() <= 3, "{crossings}");
     }
 }
