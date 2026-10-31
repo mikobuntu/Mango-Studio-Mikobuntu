@@ -6,6 +6,9 @@ target-dev/
 *.flp
 *.wav
 
+# The startup sound is an app asset baked into the binary (like the factory pack)
+!crates/os-app/assets/samples/startup.wav
+
 # Local notes and secrets
 .env
 CLAUDE.md

@@ -90,10 +90,37 @@ pub fn held(path: &Path) -> bool {
     live().lock().is_ok_and(|map| map.get(path).is_some_and(|(w, _)| w.strong_count() > 0))
 }
 
+/// Samples baked into the binary (`include_bytes!`), by file name. A load of a path that names no file on disk and
+/// ends in a registered name decodes the bytes from memory: the startup sound plays without a file next to the
+/// binary (spec: ui/settings-choices.md "Silent startup").
+static EMBEDDED: OnceLock<HashMap<String, &'static [u8]>> = OnceLock::new();
+
+/// Registers samples baked into the binary (`name` then the bytes, e.g. `("startup.wav", STARTUP_WAV)`): a real
+/// file of the same name always wins, the bytes play only where the path names no file on disk. Call once, before
+/// the first preview (the registry is fixed from then on).
+pub fn register_embedded(samples: &'static [(&'static str, &'static [u8])]) {
+    let _ = EMBEDDED.set(samples.iter().map(|(name, bytes)| (name.to_string(), *bytes)).collect());
+}
+
+/// The baked-in bytes for `path`, when the path names no file on disk and its file name is registered.
+fn embedded(path: &Path) -> Option<&'static [u8]> {
+    if path.exists() {
+        return None;
+    }
+    EMBEDDED.get()?.get(path.file_name()?.to_str()?).copied()
+}
+
 /// `load`, shared: while any holder keeps a decoded file alive, loading the same unchanged file again returns that
 /// copy instead of decoding it again. Project loading decodes samples on worker threads this way so that the plugin
 /// instances made afterwards on the UI thread find them ready (spec: ui/project-loading.md).
 pub fn load_shared(path: &Path) -> Result<Arc<Sample>, SampleError> {
+    // A baked-in sample (`register_embedded`): the path names no file on disk, so the registered bytes decode from
+    // memory (a real file of the same name always wins).
+    if let Some(bytes) = embedded(path) {
+        let decode_err = |message: String| SampleError::Decode { path: path.to_owned(), message };
+        let ext = path.extension().and_then(|e| e.to_str());
+        return Ok(Arc::new(decode(bytes.to_vec(), ext).map_err(decode_err)?));
+    }
     let live = live();
     let st = stamp(path);
     if let (Some(st), Ok(map)) = (st, live.lock()) {

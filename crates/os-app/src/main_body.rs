@@ -538,6 +538,12 @@ impl Shell {
                 self.splash = None;
             }
         }
+        // The startup sound: startup is done — the splash has gone (or there was none) and the main window has
+        // shown its first frame — so the baked-in sample plays once (the settings' Silent startup mutes it,
+        // spec: ui/settings-choices.md).
+        if self.shown && self.splash.is_none() {
+            crate::startup_sound::play_once(&self.app);
+        }
         // Linux: a docked plugin window uncovered part of the main window, which needs presenting again.
         #[cfg(target_os = "linux")]
         {

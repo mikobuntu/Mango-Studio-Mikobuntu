@@ -112,6 +112,7 @@ mod snap;
 mod song_pos;
 mod toolbar;
 mod splash;
+mod startup_sound;
 mod stall;
 mod step_edit;
 mod strum;
