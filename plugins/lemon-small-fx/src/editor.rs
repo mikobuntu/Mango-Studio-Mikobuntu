@@ -1162,7 +1162,7 @@ mod tests {
             }
             pm.save_png(std::path::Path::new(&dir).join(format!("{name}.png"))).unwrap();
         };
-        let settings: [(&Spec, &str, &[(&str, i32)]); 10] = [
+        let settings: [(&Spec, &str, &[(&str, i32)]); 11] = [
             (soft_clipper::SPEC, "soft_clipper", &[("threshold", 64), ("post", 150)]),
             (fast_distortion::SPEC, "fast_distortion", &[("pre", 192), ("threshold", 3), ("type", 1), ("mix", 100), ("post", 110)]),
             (balance::SPEC, "balance", &[("balance", -70), ("volume", 220)]),
@@ -1177,6 +1177,7 @@ mod tests {
             (filter::SPEC, "filter", &[("cutoff", 544), ("resonance", 900), ("low", 0), ("band", 1024), ("high", 464), ("x2", 1)]),
             (flanger::SPEC, "flanger", &[("delay", 300), ("depth", 4200), ("rate", 900), ("shape", 512), ("feed", 70), ("invert_feed", 0), ("damp", 1500), ("cross", 0)]),
             (phaser::SPEC, "phaser", &[("sweep", 4000), ("range", 1024), ("stages", 15), ("feedback", 850), ("dry_wet", 0), ("gain", 2500)]),
+            (twelve::SPEC, "twelve", &[("tune", 30), ("in", 60), ("route", 7), ("crush", 1)]),
         ];
         for (spec, name, values) in settings {
             let mut l = logic(spec);
